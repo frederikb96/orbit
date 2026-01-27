@@ -126,3 +126,16 @@ export interface PaginatedEntries {
 	cursor: number; // byte offset for loading more
 	hasMore: boolean;
 }
+
+// Configuration
+export interface OrbitConfig {
+	ui: UIConfig;
+}
+
+export interface UIConfig {
+	defaultExpandThinking: boolean;
+	defaultExpandToolCalls: boolean;
+	maxEntriesInMemory: number; // 0 = unlimited
+	maxSessions: number; // Limit sidebar sessions (0 = unlimited)
+	sessionPollInterval: number; // Client poll interval in ms (0 = disabled)
+}

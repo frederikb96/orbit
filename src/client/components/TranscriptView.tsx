@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatNumber, formatTime, formatToolInput } from '../../shared/formatters.ts';
-import type { ParsedEntry, SessionInfo, TokenStats } from '../../types/index.ts';
+import type { ParsedEntry, ParsedToolResult, SessionInfo, TokenStats } from '../../types/index.ts';
+import { useConfig } from '../ConfigContext.tsx';
 
 interface TranscriptViewProps {
 	session: SessionInfo;
@@ -8,7 +10,12 @@ interface TranscriptViewProps {
 	tokens: TokenStats | null;
 	hasMore: boolean;
 	loadingMore: boolean;
+	transcriptLoading: boolean;
 	onLoadMore: () => void;
+	expandThinking: boolean | null;
+	expandToolCalls: boolean | null;
+	onToggleExpandThinking: () => void;
+	onToggleExpandToolCalls: () => void;
 }
 
 export function TranscriptView({
@@ -17,57 +24,146 @@ export function TranscriptView({
 	tokens,
 	hasMore,
 	loadingMore,
+	transcriptLoading,
 	onLoadMore,
+	expandThinking,
+	expandToolCalls,
+	onToggleExpandThinking,
+	onToggleExpandToolCalls,
 }: TranscriptViewProps) {
+	const { config } = useConfig();
 	const [autoScroll, setAutoScroll] = useState(true);
-	const containerRef = useRef<HTMLDivElement>(null);
-	const bottomRef = useRef<HTMLDivElement>(null);
-	const prevEntriesLengthRef = useRef(entries.length);
-	const prevScrollHeightRef = useRef(0);
+	const parentRef = useRef<HTMLDivElement>(null);
+	const prevEntriesCountRef = useRef(entries.length);
+	const prevFirstEntryIdRef = useRef<string | null>(null);
+	const isLoadingMoreRef = useRef(false);
 
-	// Auto-scroll to bottom on new entries (only if autoScroll enabled and entries were appended)
-	useEffect(() => {
-		const container = containerRef.current;
-		if (!container) return;
+	// Effective expand state (null means use config default)
+	const effectiveExpandThinking = expandThinking ?? config.defaultExpandThinking;
+	const effectiveExpandToolCalls = expandToolCalls ?? config.defaultExpandToolCalls;
 
-		// If entries were prepended (older loaded), maintain scroll position
-		if (entries.length > prevEntriesLengthRef.current && prevScrollHeightRef.current > 0) {
-			const scrollHeightDiff = container.scrollHeight - prevScrollHeightRef.current;
-			if (scrollHeightDiff > 0 && container.scrollTop < 100) {
-				// Entries prepended - adjust scroll to maintain position
-				container.scrollTop += scrollHeightDiff;
+	// Build tool result map (stored in ref for stable reference) and filter displayable entries
+	const toolResultMapRef = useRef<Map<string, ParsedToolResult>>(new Map());
+	const displayEntries = useMemo(() => {
+		const resultMap = new Map<string, ParsedToolResult>();
+		const toolCallIds = new Set<string>();
+
+		// First pass: collect all tool call IDs and tool results
+		for (const entry of entries) {
+			if (entry.type === 'tool_result' && entry.toolResult) {
+				resultMap.set(entry.toolResult.toolUseId, entry.toolResult);
+			}
+			if (entry.type === 'assistant' && entry.toolCalls) {
+				for (const tool of entry.toolCalls) {
+					toolCallIds.add(tool.id);
+				}
 			}
 		}
 
-		// Auto-scroll to bottom for new entries at end
-		if (autoScroll && bottomRef.current) {
-			bottomRef.current.scrollIntoView({ behavior: 'smooth' });
-		}
+		// Update ref with new map
+		toolResultMapRef.current = resultMap;
 
-		prevEntriesLengthRef.current = entries.length;
-	}, [entries, autoScroll]);
+		// Second pass: filter out tool_results that are consumed by their tool calls
+		return entries.filter((entry) => {
+			if (entry.type === 'tool_result' && entry.toolResult) {
+				return !toolCallIds.has(entry.toolResult.toolUseId);
+			}
+			return true;
+		});
+	}, [entries]);
 
-	// Store scroll height before render for position restoration
-	useEffect(() => {
-		if (containerRef.current) {
-			prevScrollHeightRef.current = containerRef.current.scrollHeight;
-		}
+	// Stable callback for looking up tool results (avoids prop reference changes)
+	const getToolResult = useCallback(
+		(toolUseId: string): ParsedToolResult | undefined => toolResultMapRef.current.get(toolUseId),
+		[],
+	);
+
+	// Virtualizer for efficient rendering
+	const virtualizer = useVirtualizer({
+		count: displayEntries.length,
+		getScrollElement: () => parentRef.current,
+		estimateSize: () => 200, // Estimate largest expected height (reduces re-measurement)
+		overscan: 5, // Render 5 extra items above/below viewport
+		getItemKey: (index) => displayEntries[index]?.id ?? index,
+		// Disable synchronous layout flush - critical for high-frequency updates
+		useFlushSync: false,
 	});
 
-	// Detect manual scroll and trigger load more when near top
-	const handleScroll = () => {
-		if (!containerRef.current) return;
-		const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
+	// Handle entries being prepended (when loading older)
+	useEffect(() => {
+		const prevCount = prevEntriesCountRef.current;
+		const prevFirstId = prevFirstEntryIdRef.current;
 
-		// Check if at bottom
-		const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
-		setAutoScroll(isAtBottom);
+		if (displayEntries.length > 0) {
+			const currentFirstId = displayEntries[0].id;
 
-		// Load more when scrolling near top
-		if (scrollTop < 200 && hasMore && !loadingMore) {
-			onLoadMore();
+			// Check if entries were prepended (new first entry ID)
+			if (prevFirstId && prevFirstId !== currentFirstId && displayEntries.length > prevCount) {
+				// Find the index of what was previously the first entry
+				const previousFirstIndex = displayEntries.findIndex((e) => e.id === prevFirstId);
+
+				if (previousFirstIndex > 0 && isLoadingMoreRef.current) {
+					// Scroll to maintain position after prepend
+					requestAnimationFrame(() => {
+						virtualizer.scrollToIndex(previousFirstIndex, { align: 'start' });
+					});
+					isLoadingMoreRef.current = false;
+				}
+			}
+
+			prevFirstEntryIdRef.current = currentFirstId;
 		}
-	};
+
+		prevEntriesCountRef.current = displayEntries.length;
+	}, [displayEntries, virtualizer]);
+
+	// Auto-scroll to bottom on new entries at end (using RAF + direct DOM, not state)
+	useEffect(() => {
+		if (autoScroll && displayEntries.length > 0 && !isLoadingMoreRef.current) {
+			requestAnimationFrame(() => {
+				const el = parentRef.current;
+				if (el) {
+					el.scrollTop = el.scrollHeight;
+				}
+			});
+		}
+	}, [displayEntries.length, autoScroll]);
+
+	// Throttled scroll handler
+	const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const handleScroll = useCallback(() => {
+		if (scrollTimeoutRef.current) return;
+
+		scrollTimeoutRef.current = setTimeout(() => {
+			scrollTimeoutRef.current = null;
+
+			const scrollEl = parentRef.current;
+			if (!scrollEl) return;
+
+			const { scrollTop, scrollHeight, clientHeight } = scrollEl;
+
+			// Check if at bottom for auto-scroll (strict: only when truly at end)
+			const isAtBottom = scrollHeight - scrollTop - clientHeight < 5;
+			setAutoScroll(isAtBottom);
+
+			// Load more when near top
+			if (scrollTop < 300 && hasMore && !loadingMore && !isLoadingMoreRef.current) {
+				isLoadingMoreRef.current = true;
+				onLoadMore();
+			}
+		}, 50); // Throttle to 50ms
+	}, [hasMore, loadingMore, onLoadMore]);
+
+	// Cleanup throttle timeout on unmount
+	useEffect(() => {
+		return () => {
+			if (scrollTimeoutRef.current) {
+				clearTimeout(scrollTimeoutRef.current);
+			}
+		};
+	}, []);
+
+	const virtualItems = virtualizer.getVirtualItems();
 
 	return (
 		<div className="transcript-view">
@@ -85,6 +181,32 @@ export function TranscriptView({
 						<span className="token-stat turns">Turns: {tokens.turns}</span>
 					</div>
 				)}
+				<div className="expand-toggles">
+					<button
+						type="button"
+						className={`expand-toggle ${effectiveExpandThinking ? 'active' : ''}`}
+						onClick={onToggleExpandThinking}
+						title={
+							effectiveExpandThinking
+								? 'Thinking expanded (click to collapse)'
+								: 'Thinking collapsed (click to expand)'
+						}
+					>
+						💭 {effectiveExpandThinking ? 'Expanded' : 'Collapsed'}
+					</button>
+					<button
+						type="button"
+						className={`expand-toggle ${effectiveExpandToolCalls ? 'active' : ''}`}
+						onClick={onToggleExpandToolCalls}
+						title={
+							effectiveExpandToolCalls
+								? 'Tools expanded (click to collapse)'
+								: 'Tools collapsed (click to expand)'
+						}
+					>
+						🔧 {effectiveExpandToolCalls ? 'Expanded' : 'Collapsed'}
+					</button>
+				</div>
 				<button
 					type="button"
 					className={`auto-scroll-btn ${autoScroll ? 'active' : ''}`}
@@ -95,7 +217,12 @@ export function TranscriptView({
 				</button>
 			</header>
 
-			<div className="entries-container" ref={containerRef} onScroll={handleScroll}>
+			<div
+				className="entries-container"
+				ref={parentRef}
+				onScroll={handleScroll}
+				style={{ contain: 'strict' }}
+			>
 				{loadingMore && (
 					<div className="loading-more">
 						<div className="spinner-small" />
@@ -103,12 +230,45 @@ export function TranscriptView({
 					</div>
 				)}
 				{hasMore && !loadingMore && <div className="load-more-hint">↑ Scroll up to load more</div>}
-				{entries.length === 0 ? (
+
+				{transcriptLoading ? (
 					<div className="loading-entries">Loading transcript...</div>
+				) : displayEntries.length === 0 ? (
+					<div className="empty-transcript">No entries in this transcript</div>
 				) : (
-					entries.map((entry) => <EntryCard key={entry.id} entry={entry} />)
+					<div
+						style={{
+							height: `${virtualizer.getTotalSize()}px`,
+							width: '100%',
+							position: 'relative',
+						}}
+					>
+						{virtualItems.map((virtualRow) => {
+							const entry = displayEntries[virtualRow.index];
+							return (
+								<div
+									key={virtualRow.key}
+									data-index={virtualRow.index}
+									ref={virtualizer.measureElement}
+									style={{
+										position: 'absolute',
+										top: 0,
+										left: 0,
+										width: '100%',
+										transform: `translateY(${virtualRow.start}px)`,
+									}}
+								>
+									<MemoizedEntryCard
+										entry={entry}
+										expandThinking={effectiveExpandThinking}
+										expandToolCalls={effectiveExpandToolCalls}
+										getToolResult={getToolResult}
+									/>
+								</div>
+							);
+						})}
+					</div>
 				)}
-				<div ref={bottomRef} />
 			</div>
 		</div>
 	);
@@ -116,24 +276,41 @@ export function TranscriptView({
 
 interface EntryCardProps {
 	entry: ParsedEntry;
+	expandThinking: boolean;
+	expandToolCalls: boolean;
+	getToolResult: (toolUseId: string) => ParsedToolResult | undefined;
 }
 
-function EntryCard({ entry }: EntryCardProps) {
+const MemoizedEntryCard = memo(function EntryCard({
+	entry,
+	expandThinking,
+	expandToolCalls,
+	getToolResult,
+}: EntryCardProps) {
 	switch (entry.type) {
 		case 'user':
-			return <UserEntry entry={entry} />;
+			return <MemoizedUserEntry entry={entry} />;
 		case 'assistant':
-			return <AssistantEntry entry={entry} />;
+			return (
+				<MemoizedAssistantEntry
+					entry={entry}
+					expandThinking={expandThinking}
+					expandToolCalls={expandToolCalls}
+					getToolResult={getToolResult}
+				/>
+			);
 		case 'tool_result':
-			return <ToolResultEntry entry={entry} />;
+			// Standalone tool_result entries (not consumed by a tool call) are already
+			// filtered to displayEntries, so we always render them here
+			return <MemoizedToolResultEntry entry={entry} expanded={expandToolCalls} />;
 		case 'system':
-			return <SystemEntry entry={entry} />;
+			return <MemoizedSystemEntry entry={entry} />;
 		default:
 			return null;
 	}
-}
+});
 
-function UserEntry({ entry }: { entry: ParsedEntry }) {
+const MemoizedUserEntry = memo(function UserEntry({ entry }: { entry: ParsedEntry }) {
 	return (
 		<div className="entry user-entry">
 			<div className="entry-header">
@@ -145,9 +322,21 @@ function UserEntry({ entry }: { entry: ParsedEntry }) {
 			</div>
 		</div>
 	);
+});
+
+interface AssistantEntryProps {
+	entry: ParsedEntry;
+	expandThinking: boolean;
+	expandToolCalls: boolean;
+	getToolResult: (toolUseId: string) => ParsedToolResult | undefined;
 }
 
-function AssistantEntry({ entry }: { entry: ParsedEntry }) {
+const MemoizedAssistantEntry = memo(function AssistantEntry({
+	entry,
+	expandThinking,
+	expandToolCalls,
+	getToolResult,
+}: AssistantEntryProps) {
 	return (
 		<div className="entry assistant-entry">
 			<div className="entry-header">
@@ -162,7 +351,7 @@ function AssistantEntry({ entry }: { entry: ParsedEntry }) {
 			</div>
 
 			{entry.thinking && (
-				<details className="thinking-block">
+				<details className="thinking-block" open={expandThinking}>
 					<summary>💭 Thinking...</summary>
 					<pre>{entry.thinking}</pre>
 				</details>
@@ -177,42 +366,79 @@ function AssistantEntry({ entry }: { entry: ParsedEntry }) {
 			{entry.toolCalls && entry.toolCalls.length > 0 && (
 				<div className="tool-calls">
 					{entry.toolCalls.map((tool) => (
-						<ToolCallBlock key={tool.id} tool={tool} />
+						<MemoizedToolCallBlock
+							key={tool.id}
+							tool={tool}
+							expanded={expandToolCalls}
+							result={getToolResult(tool.id)}
+						/>
 					))}
 				</div>
 			)}
 		</div>
 	);
+});
+
+interface ToolCallBlockProps {
+	tool: NonNullable<ParsedEntry['toolCalls']>[0];
+	expanded: boolean;
+	result?: ParsedToolResult;
 }
 
-function ToolCallBlock({ tool }: { tool: NonNullable<ParsedEntry['toolCalls']>[0] }) {
-	const { summary, details } = formatToolInput(tool.name, tool.input);
+const MemoizedToolCallBlock = memo(function ToolCallBlock({
+	tool,
+	expanded,
+	result,
+}: ToolCallBlockProps) {
+	// Memoize the expensive formatToolInput call
+	const { summary, details } = useMemo(
+		() => formatToolInput(tool.name, tool.input),
+		[tool.name, tool.input],
+	);
 
 	return (
-		<details className="tool-call">
+		<details className="tool-call" open={expanded}>
 			<summary className="tool-name">
 				🔧 <span className="name">[{tool.name}]</span> {summary}
+				{result && (
+					<span
+						className={`result-indicator ${result.isError ? 'error' : 'success'}`}
+						aria-label={result.isError ? 'Error' : 'Success'}
+					>
+						{result.isError ? ' ❌' : ' ✓'}
+					</span>
+				)}
 			</summary>
 			{details && <pre className="tool-details">{details}</pre>}
+			{result && (
+				<div className={`tool-result-inline ${result.isError ? 'error' : ''}`}>
+					<div className="result-header">{result.isError ? '❌ Error' : '✓ Result'}</div>
+					<pre className="result-content">{result.content}</pre>
+				</div>
+			)}
 		</details>
 	);
-}
+});
 
-function ToolResultEntry({ entry }: { entry: ParsedEntry }) {
+const MemoizedToolResultEntry = memo(function ToolResultEntry({
+	entry,
+	expanded,
+}: { entry: ParsedEntry; expanded: boolean }) {
 	const result = entry.toolResult;
 	if (!result) return null;
 
 	return (
-		<details className={`entry tool-result-entry ${result.isError ? 'error' : ''}`}>
+		<details className={`entry tool-result-entry ${result.isError ? 'error' : ''}`} open={expanded}>
 			<summary className="result-summary">
-				{result.isError ? '❌' : '✓'} [{result.toolName}] Result
+				<span aria-label={result.isError ? 'Error' : 'Success'}>{result.isError ? '❌' : '✓'}</span>{' '}
+				[{result.toolName}] Result
 			</summary>
 			<pre className="result-content">{result.content}</pre>
 		</details>
 	);
-}
+});
 
-function SystemEntry({ entry }: { entry: ParsedEntry }) {
+const MemoizedSystemEntry = memo(function SystemEntry({ entry }: { entry: ParsedEntry }) {
 	const hook = entry.hookSummary;
 	if (!hook) return null;
 
@@ -232,4 +458,4 @@ function SystemEntry({ entry }: { entry: ParsedEntry }) {
 			)}
 		</div>
 	);
-}
+});

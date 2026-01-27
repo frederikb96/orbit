@@ -1,0 +1,47 @@
+import { type ReactNode, createContext, useContext, useEffect, useState } from 'react';
+import type { UIConfig } from '../types/index.ts';
+
+const DEFAULT_UI_CONFIG: UIConfig = {
+	defaultExpandThinking: false,
+	defaultExpandToolCalls: false,
+	maxEntriesInMemory: 0,
+	maxSessions: 10,
+	sessionPollInterval: 5_000,
+};
+
+interface ConfigContextValue {
+	config: UIConfig;
+	loading: boolean;
+}
+
+const ConfigContext = createContext<ConfigContextValue>({
+	config: DEFAULT_UI_CONFIG,
+	loading: true,
+});
+
+export function ConfigProvider({ children }: { children: ReactNode }) {
+	const [config, setConfig] = useState<UIConfig>(DEFAULT_UI_CONFIG);
+	const [loading, setLoading] = useState(true);
+
+	useEffect(() => {
+		fetch('/api/config')
+			.then((res) => {
+				if (res.ok) return res.json();
+				throw new Error('Failed to fetch config');
+			})
+			.then((data: UIConfig) => {
+				setConfig(data);
+				setLoading(false);
+			})
+			.catch(() => {
+				// Use defaults on error
+				setLoading(false);
+			});
+	}, []);
+
+	return <ConfigContext.Provider value={{ config, loading }}>{children}</ConfigContext.Provider>;
+}
+
+export function useConfig(): ConfigContextValue {
+	return useContext(ConfigContext);
+}

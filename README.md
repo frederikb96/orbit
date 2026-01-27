@@ -54,6 +54,24 @@ Orbit finds Claude Code transcripts in:
 
 Sessions modified in the last 60 seconds show as "active".
 
+## Configuration
+
+Orbit looks for config at `~/.config/orbit/config.json`:
+
+```json
+{
+  "ui": {
+    "defaultExpandThinking": true,
+    "defaultExpandToolCalls": false,
+    "maxEntriesInMemory": 0
+  }
+}
+```
+
+- `defaultExpandThinking`: Show thinking blocks expanded by default
+- `defaultExpandToolCalls`: Show tool calls expanded by default
+- `maxEntriesInMemory`: Cap entries in browser memory (0 = unlimited)
+
 ## Architecture
 
 ```

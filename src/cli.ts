@@ -58,16 +58,27 @@ program
 
 			child.unref();
 
-			// Wait a moment for server to start
-			await Bun.sleep(500);
+			// Poll health endpoint until server is ready (up to 15s - discovery can take ~8s)
+			let serverReady = false;
+			for (let attempt = 0; attempt < 30; attempt++) {
+				await Bun.sleep(500);
+				try {
+					const res = await fetch(`http://localhost:${port}/api/health`);
+					if (res.ok) {
+						serverReady = true;
+						break;
+					}
+				} catch {
+					// Server not ready yet
+				}
+			}
 
-			// Check if it started
-			const state = getServerState();
-			if (state && isProcessRunning(state.pid)) {
-				console.log(`Orbit started on http://localhost:${port} (PID: ${state.pid})`);
+			if (serverReady) {
+				const state = getServerState();
+				console.log(`Orbit started on http://localhost:${port} (PID: ${state?.pid || 'unknown'})`);
 				console.log('View logs: orbit logs -f');
 			} else {
-				console.error('Failed to start Orbit. Check logs: orbit logs');
+				console.error('Failed to start Orbit - health check timeout. Check logs: orbit logs');
 				process.exit(1);
 			}
 		}

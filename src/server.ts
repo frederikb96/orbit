@@ -6,6 +6,8 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
+import pkg from '../package.json';
+import { getConfig } from './lib/config.ts';
 import { getLogger } from './lib/logger.ts';
 import { getSessionManager } from './lib/sessions.ts';
 import { DEFAULT_LIMIT, StreamingParser, parseTranscriptTail } from './lib/transcript.ts';
@@ -28,6 +30,10 @@ interface SSEClient {
 	cleanup: () => void;
 }
 
+// Session cache refresh interval (ms) - balance freshness vs CPU
+// Discovery scans all files, so can't be too frequent
+const SESSION_REFRESH_INTERVAL_MS = 30_000;
+
 class OrbitServer {
 	private port: number;
 	private publicDir: string;
@@ -36,6 +42,7 @@ class OrbitServer {
 	private logger = getLogger();
 	private server: ReturnType<typeof Bun.serve> | null = null;
 	private clientCounter = 0;
+	private refreshInterval: ReturnType<typeof setInterval> | null = null;
 
 	constructor(port: number) {
 		this.port = port;
@@ -48,6 +55,15 @@ class OrbitServer {
 
 		// Discover sessions on start
 		await this.sessionManager.discover();
+
+		// Background refresh of session cache (fast - only scans for newest files)
+		this.refreshInterval = setInterval(() => {
+			this.sessionManager.discover().catch((err) => {
+				this.logger.debug('session_refresh_error', {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+		}, SESSION_REFRESH_INTERVAL_MS);
 
 		this.server = Bun.serve({
 			hostname: 'localhost',
@@ -87,6 +103,12 @@ class OrbitServer {
 	}
 
 	stop(): void {
+		// Stop background refresh
+		if (this.refreshInterval) {
+			clearInterval(this.refreshInterval);
+			this.refreshInterval = null;
+		}
+
 		// Close all SSE connections
 		for (const client of this.clients.values()) {
 			client.cleanup();
@@ -105,9 +127,21 @@ class OrbitServer {
 	}
 
 	private async handleAPI(req: Request, path: string): Promise<Response> {
-		// GET /api/sessions - List all sessions
+		// GET /api/health - Health check
+		if (path === '/api/health' && req.method === 'GET') {
+			return Response.json({ status: 'ok', version: pkg.version });
+		}
+
+		// GET /api/config - Client configuration
+		if (path === '/api/config' && req.method === 'GET') {
+			const config = getConfig();
+			return Response.json(config.ui);
+		}
+
+		// GET /api/sessions - List all sessions (from cache, instant)
 		if (path === '/api/sessions' && req.method === 'GET') {
-			const sessions = await this.sessionManager.discover();
+			const config = getConfig();
+			const sessions = this.sessionManager.getSessions(config.ui.maxSessions);
 			return Response.json(sessions);
 		}
 
@@ -157,26 +191,55 @@ class OrbitServer {
 
 	private createSSEStream(session: SessionInfo): Response {
 		const clientId = `client-${++this.clientCounter}`;
-		const parser = new StreamingParser();
 		let lastPosition = 0;
+		let isInitialized = false;
+		// Parser will be initialized with correct byte offset after initial load
+		const parser = new StreamingParser(0);
 		let pingInterval: ReturnType<typeof setInterval> | null = null;
+		const encoder = new TextEncoder();
 
 		const stream = new ReadableStream({
 			start: (controller) => {
-				// Set up file watcher
+				// Set up file watcher (debounced at 100ms in SessionManager)
 				const cleanup = this.sessionManager.watchSession(session.id, async () => {
+					// Skip if not initialized yet (avoid race with initial load)
+					if (!isInitialized) return;
+
 					try {
 						const file = Bun.file(session.path);
 						const size = file.size;
+
+						// Handle file truncation (rotation)
+						if (size < lastPosition) {
+							lastPosition = 0;
+							parser.setByteOffset(0);
+							try {
+								controller.enqueue(
+									encoder.encode(
+										`data: ${JSON.stringify({ type: 'truncated', sessionId: session.id })}\n\n`,
+									),
+								);
+							} catch {
+								// Client disconnected
+								return;
+							}
+						}
+
+						// No new data
 						if (size <= lastPosition) return;
 
 						const content = await file.slice(lastPosition).text();
 						lastPosition = size;
 
 						const entries = parser.parse(content);
-						for (const entry of entries) {
-							const data = `data: ${JSON.stringify(entry)}\n\n`;
-							controller.enqueue(new TextEncoder().encode(data));
+						if (entries.length === 0) return;
+
+						// Send as batch with session ID (client processes in single state update)
+						try {
+							const batchData = `data: ${JSON.stringify({ type: 'batch', entries, sessionId: session.id })}\n\n`;
+							controller.enqueue(encoder.encode(batchData));
+						} catch {
+							// Client disconnected - cleanup will happen in cancel()
 						}
 					} catch (err) {
 						this.logger.debug('sse_file_watch_error', {
@@ -207,9 +270,32 @@ class OrbitServer {
 							DEFAULT_LIMIT,
 						);
 
-						// Send initial entries with pagination info
-						const initData = `data: ${JSON.stringify({ type: 'init', entries, cursor, hasMore })}\n\n`;
-						controller.enqueue(new TextEncoder().encode(initData));
+						// Set parser's byte offset for streaming new entries with correct IDs
+						parser.setByteOffset(lastPosition);
+
+						// Send initial entries with pagination info and session ID
+						const initData = `data: ${JSON.stringify({ type: 'init', entries, cursor, hasMore, sessionId: session.id })}\n\n`;
+						controller.enqueue(encoder.encode(initData));
+
+						// Mark as initialized - now file watcher callbacks can process
+						isInitialized = true;
+
+						// Catch any file changes that occurred during init (race condition fix)
+						const currentFile = Bun.file(session.path);
+						const currentSize = currentFile.size;
+						if (currentSize > lastPosition) {
+							const missedContent = await currentFile.slice(lastPosition).text();
+							lastPosition = currentSize;
+							const missedEntries = parser.parse(missedContent);
+							if (missedEntries.length > 0) {
+								try {
+									const batchData = `data: ${JSON.stringify({ type: 'batch', entries: missedEntries, sessionId: session.id })}\n\n`;
+									controller.enqueue(encoder.encode(batchData));
+								} catch {
+									// Client disconnected
+								}
+							}
+						}
 					} catch (err) {
 						this.logger.debug('sse_initial_read_error', {
 							session_id: session.id,

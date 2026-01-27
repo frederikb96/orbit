@@ -1,18 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ParsedEntry, SessionInfo, TokenStats } from '../types/index.ts';
+import { useConfig } from './ConfigContext.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { TranscriptView } from './components/TranscriptView.tsx';
 
-// Max entries to keep in memory to prevent DOM overload
-const MAX_ENTRIES = 300;
-
 export function App() {
+	const { config } = useConfig();
 	const [sessions, setSessions] = useState<SessionInfo[]>([]);
 	const [selectedSession, setSelectedSession] = useState<SessionInfo | null>(null);
 	const [entries, setEntries] = useState<ParsedEntry[]>([]);
 	const [tokens, setTokens] = useState<TokenStats | null>(null);
 	const [loading, setLoading] = useState(true);
+	const [transcriptLoading, setTranscriptLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+
+	// Expand state for thinking/tool blocks
+	const [expandThinking, setExpandThinking] = useState<boolean | null>(null);
+	const [expandToolCalls, setExpandToolCalls] = useState<boolean | null>(null);
 
 	// Pagination state
 	const [cursor, setCursor] = useState<number>(0);
@@ -39,12 +43,15 @@ export function App() {
 		}
 	}, []);
 
-	// Initial fetch and periodic refresh
+	// Initial fetch and periodic refresh (configurable interval)
 	useEffect(() => {
 		fetchSessions();
-		const interval = setInterval(fetchSessions, 10_000); // Refresh every 10s
-		return () => clearInterval(interval);
-	}, [fetchSessions]);
+		// Poll interval from config (0 = disabled)
+		if (config.sessionPollInterval > 0) {
+			const interval = setInterval(fetchSessions, config.sessionPollInterval);
+			return () => clearInterval(interval);
+		}
+	}, [fetchSessions, config.sessionPollInterval]);
 
 	// Fetch more (older) entries when scrolling up
 	const fetchMoreEntries = useCallback(async () => {
@@ -68,6 +75,14 @@ export function App() {
 		}
 	}, [hasMore, loadingMore, cursor]);
 
+	// SSE reconnect constants
+	const SSE_MAX_RETRIES = 10;
+	const SSE_BASE_DELAY_MS = 2000;
+	const SSE_MAX_DELAY_MS = 30000;
+
+	// SSE connection error state
+	const [sseError, setSseError] = useState<string | null>(null);
+
 	// Connect to SSE stream when session selected
 	useEffect(() => {
 		if (!selectedSession) {
@@ -75,10 +90,13 @@ export function App() {
 			setTokens(null);
 			setCursor(0);
 			setHasMore(false);
+			setSseError(null);
 			return;
 		}
 
 		let eventSource: EventSource | null = null;
+		let retryCount = 0;
+		let isFirstInit = true; // Track first init vs reconnect
 
 		const connect = () => {
 			eventSource = new EventSource(`/api/sessions/${selectedSession.id}/stream`);
@@ -87,28 +105,87 @@ export function App() {
 				try {
 					const data = JSON.parse(event.data);
 
+					// Verify session ID matches (avoid cross-session contamination during switch)
+					if (data.sessionId && data.sessionId !== selectedSession.id) {
+						return;
+					}
+
+					// Reset retry count on successful message
+					retryCount = 0;
+					setSseError(null);
+
 					// Initial load (tail of transcript)
 					if (data.type === 'init') {
-						setEntries(data.entries);
+						// First init: always set entries (even if empty - shows "No entries")
+						// Reconnect: only update if we have new entries (prevents flicker)
+						if (isFirstInit || data.entries.length > 0) {
+							setEntries(data.entries);
+							const stats = calculateTokens(data.entries);
+							setTokens(stats);
+						}
+						isFirstInit = false;
 						setCursor(data.cursor || 0);
 						setHasMore(data.hasMore || false);
-						// Calculate tokens from entries
-						const stats = calculateTokens(data.entries);
-						setTokens(stats);
+						setTranscriptLoading(false);
 					}
-					// New entry - append and cap memory
-					else {
+					// Batch of new entries (debounced from server)
+					else if (data.type === 'batch' && Array.isArray(data.entries)) {
+						const newEntries = data.entries as ParsedEntry[];
+						if (newEntries.length === 0) return;
+
+						// Single state update for all entries in batch
 						setEntries((prev) => {
-							const updated = [...prev, data];
-							// Cap at MAX_ENTRIES to prevent memory bloat
-							if (updated.length > MAX_ENTRIES) {
-								return updated.slice(-MAX_ENTRIES);
+							const updated = [...prev, ...newEntries];
+							const maxEntries = config.maxEntriesInMemory;
+							if (maxEntries > 0 && updated.length > maxEntries) {
+								return updated.slice(-maxEntries);
 							}
 							return updated;
 						});
-						if (data.tokens) {
-							setTokens((prev) => updateTokenStats(prev, data.tokens));
-						}
+
+						// Single token stats update (reduce all entries, including turn count)
+						setTokens((prev) => {
+							let stats = prev;
+							for (const entry of newEntries) {
+								// Increment turn counter for user entries
+								if (entry.type === 'user') {
+									stats = { ...stats, turns: (stats?.turns || 0) + 1 } as typeof stats;
+								}
+								if (entry.tokens) {
+									stats = updateTokenStats(stats, entry.tokens);
+								}
+							}
+							return stats;
+						});
+					}
+					// File truncation (rotation) - reload from server
+					else if (data.type === 'truncated') {
+						setEntries([]);
+						setTokens(null);
+						setCursor(0);
+						setHasMore(false);
+					}
+					// Legacy: single entry (backwards compatibility)
+					else if (data.type !== 'init' && data.type !== 'batch' && data.type !== 'truncated') {
+						setEntries((prev) => {
+							const updated = [...prev, data];
+							const maxEntries = config.maxEntriesInMemory;
+							if (maxEntries > 0 && updated.length > maxEntries) {
+								return updated.slice(-maxEntries);
+							}
+							return updated;
+						});
+						// Update tokens and turn count
+						setTokens((prev) => {
+							let stats = prev;
+							if (data.type === 'user') {
+								stats = { ...stats, turns: (stats?.turns || 0) + 1 } as typeof stats;
+							}
+							if (data.tokens) {
+								stats = updateTokenStats(stats, data.tokens);
+							}
+							return stats;
+						});
 					}
 				} catch {
 					// Parse error
@@ -117,8 +194,18 @@ export function App() {
 
 			eventSource.onerror = () => {
 				eventSource?.close();
-				// Reconnect after 2s
-				setTimeout(connect, 2000);
+
+				retryCount++;
+				if (retryCount > SSE_MAX_RETRIES) {
+					// Max retries exceeded - show error and stop
+					setSseError(`Connection lost after ${SSE_MAX_RETRIES} retries`);
+					setTranscriptLoading(false);
+					return;
+				}
+
+				// Exponential backoff: 2s, 4s, 8s, ... up to 30s
+				const delay = Math.min(SSE_BASE_DELAY_MS * 2 ** (retryCount - 1), SSE_MAX_DELAY_MS);
+				setTimeout(connect, delay);
 			};
 		};
 
@@ -127,7 +214,7 @@ export function App() {
 		return () => {
 			eventSource?.close();
 		};
-	}, [selectedSession]);
+	}, [selectedSession, config.maxEntriesInMemory]);
 
 	const handleSelectSession = (session: SessionInfo) => {
 		setSelectedSession(session);
@@ -135,6 +222,7 @@ export function App() {
 		setTokens(null);
 		setCursor(0);
 		setHasMore(false);
+		setTranscriptLoading(true);
 	};
 
 	if (loading) {
@@ -168,14 +256,42 @@ export function App() {
 			/>
 			<main className="main-content">
 				{selectedSession ? (
-					<TranscriptView
-						session={selectedSession}
-						entries={entries}
-						tokens={tokens}
-						hasMore={hasMore}
-						loadingMore={loadingMore}
-						onLoadMore={fetchMoreEntries}
-					/>
+					<>
+						{sseError && (
+							<div className="sse-error">
+								<span>{sseError}</span>
+								<button
+									type="button"
+									onClick={() => {
+										setSseError(null);
+										setTranscriptLoading(true);
+										setSelectedSession({ ...selectedSession });
+									}}
+								>
+									Retry
+								</button>
+							</div>
+						)}
+						<TranscriptView
+							session={selectedSession}
+							entries={entries}
+							tokens={tokens}
+							hasMore={hasMore}
+							loadingMore={loadingMore}
+							transcriptLoading={transcriptLoading}
+							onLoadMore={fetchMoreEntries}
+							expandThinking={expandThinking}
+							expandToolCalls={expandToolCalls}
+							onToggleExpandThinking={() =>
+								setExpandThinking((prev) => (prev === null ? !config.defaultExpandThinking : !prev))
+							}
+							onToggleExpandToolCalls={() =>
+								setExpandToolCalls((prev) =>
+									prev === null ? !config.defaultExpandToolCalls : !prev,
+								)
+							}
+						/>
+					</>
 				) : (
 					<div className="empty-state">
 						<h2>Select a session</h2>

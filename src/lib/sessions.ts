@@ -13,12 +13,18 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const AGENT_ID_REGEX = /^agent-([a-f0-9]+)\.jsonl$/;
 const ACTIVE_THRESHOLD_MS = 60_000; // 60 seconds
 
+// Debounce window for file watcher events (ms)
+const FILE_WATCH_DEBOUNCE_MS = 100;
+
 export class SessionManager {
 	private home: string;
-	private sessions: Map<string, SessionInfo> = new Map();
 	private watchers: Map<string, FSWatcher> = new Map();
 	private updateCallbacks: Set<(sessions: SessionInfo[]) => void> = new Set();
 	private fileCallbacks: Map<string, Set<(path: string) => void>> = new Map();
+	private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+	private cachedSessions: SessionInfo[] = [];
+	private sessionsByPath: Map<string, SessionInfo> = new Map();
+	private lastDiscoveryMs = 0;
 
 	constructor() {
 		this.home = homedir();
@@ -51,14 +57,40 @@ export class SessionManager {
 			}
 		}
 
-		// Update internal map
-		this.sessions.clear();
-		for (const session of sessions) {
-			this.sessions.set(session.id, session);
-		}
-
 		// Sort by mtime descending (most recent first)
-		return sessions.sort((a, b) => b.mtime - a.mtime);
+		const sorted = sessions.sort((a, b) => b.mtime - a.mtime);
+
+		// Cache the results and build path lookup
+		this.cachedSessions = sorted;
+		this.sessionsByPath.clear();
+		for (const session of sorted) {
+			this.sessionsByPath.set(session.path, session);
+		}
+		this.lastDiscoveryMs = Date.now();
+		logger.debug('sessions_cached', { count: sorted.length });
+
+		return sorted;
+	}
+
+	/**
+	 * Get cached sessions, limited by maxSessions config.
+	 * Filters out empty files (0 bytes) - no point showing them.
+	 * Returns instantly without scanning filesystem.
+	 */
+	getSessions(limit = 0): SessionInfo[] {
+		// Filter out empty files
+		const nonEmpty = this.cachedSessions.filter((s) => s.size > 0);
+		if (limit > 0 && nonEmpty.length > limit) {
+			return nonEmpty.slice(0, limit);
+		}
+		return nonEmpty;
+	}
+
+	/**
+	 * Get time since last discovery (ms)
+	 */
+	getLastDiscoveryAge(): number {
+		return Date.now() - this.lastDiscoveryMs;
 	}
 
 	/**
@@ -113,30 +145,36 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get a specific session by ID
+	 * Get a specific session by ID.
+	 * Returns null if session not in cache - no filesystem scanning.
 	 */
 	async getSession(id: string): Promise<SessionInfo | null> {
-		// Check cache first
-		const cached = this.sessions.get(id);
-		if (cached) {
-			// Refresh stats
-			const info = await this.getSessionInfo(cached.path);
-			if (info) {
-				this.sessions.set(id, info);
-				return info;
-			}
+		// Search cached sessions (only source of truth for known sessions)
+		const cached = this.cachedSessions.find((s) => s.id === id);
+		if (!cached) {
+			return null;
 		}
 
-		// Try to find it
-		const sessions = await this.discover();
-		return sessions.find((s) => s.id === id) || null;
+		// Refresh stats for the cached session
+		const info = await this.getSessionInfo(cached.path);
+		if (info) {
+			// Update in cache
+			const idx = this.cachedSessions.findIndex((s) => s.id === id);
+			if (idx !== -1) {
+				this.cachedSessions[idx] = info;
+				this.sessionsByPath.set(info.path, info);
+			}
+			return info;
+		}
+
+		return cached;
 	}
 
 	/**
 	 * Watch a specific session file for changes
 	 */
 	watchSession(sessionId: string, callback: (path: string) => void): () => void {
-		const session = this.sessions.get(sessionId);
+		const session = this.cachedSessions.find((s) => s.id === sessionId);
 		if (!session) {
 			return () => {};
 		}
@@ -152,14 +190,24 @@ export class SessionManager {
 		// Start watcher if not already watching
 		if (!this.watchers.has(session.path)) {
 			try {
-				const watcher = watch(session.path, (event) => {
+				const watchPath = session.path;
+				const watcher = watch(watchPath, (event) => {
 					if (event === 'change') {
-						const cbs = this.fileCallbacks.get(session.path);
-						if (cbs) {
-							for (const cb of cbs) {
-								cb(session.path);
-							}
+						// Debounce: clear existing timer and set new one
+						const existingTimer = this.debounceTimers.get(watchPath);
+						if (existingTimer) {
+							clearTimeout(existingTimer);
 						}
+						const timer = setTimeout(() => {
+							this.debounceTimers.delete(watchPath);
+							const cbs = this.fileCallbacks.get(watchPath);
+							if (cbs) {
+								for (const cb of cbs) {
+									cb(watchPath);
+								}
+							}
+						}, FILE_WATCH_DEBOUNCE_MS);
+						this.debounceTimers.set(watchPath, timer);
 					}
 				});
 				this.watchers.set(session.path, watcher);
@@ -177,6 +225,12 @@ export class SessionManager {
 			callbacks?.delete(callback);
 			if (callbacks?.size === 0) {
 				this.fileCallbacks.delete(session.path);
+				// Clear debounce timer for this path
+				const timer = this.debounceTimers.get(session.path);
+				if (timer) {
+					clearTimeout(timer);
+					this.debounceTimers.delete(session.path);
+				}
 				const watcher = this.watchers.get(session.path);
 				if (watcher) {
 					watcher.close();
@@ -209,6 +263,12 @@ export class SessionManager {
 	 * Clean up all watchers
 	 */
 	cleanup(): void {
+		// Clear all debounce timers
+		for (const timer of this.debounceTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.debounceTimers.clear();
+		// Close all file watchers
 		for (const watcher of this.watchers.values()) {
 			watcher.close();
 		}
