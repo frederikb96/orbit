@@ -1,0 +1,36 @@
+{
+	"name": "orbit",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Web-based Claude Code transcript viewer with real-time streaming",
+	"author": "Frederik Berg",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/frederikb96/orbit.git"
+	},
+	"bin": {
+		"orbit": "./src/cli.ts"
+	},
+	"scripts": {
+		"dev": "bun --watch src/cli.ts start",
+		"start": "bun src/cli.ts start",
+		"build": "bun build src/client/index.tsx --outfile=public/bundle.js --minify",
+		"test": "bun test",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"commander": "^12.1.0",
+		"react": "^18.3.1",
+		"react-dom": "^18.3.1"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.4",
+		"@types/bun": "^1.1.14",
+		"@types/react": "^18.3.12",
+		"@types/react-dom": "^18.3.1",
+		"typescript": "^5.7.2"
+	}
+}
