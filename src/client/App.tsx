@@ -1,13 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ParsedEntry, SessionInfo, TokenStats } from '../types/index.ts';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ParsedEntry, Session, TokenStats } from '../types.ts';
 import { useConfig } from './ConfigContext.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { TranscriptView } from './components/TranscriptView.tsx';
 
 export function App() {
 	const { config } = useConfig();
-	const [sessions, setSessions] = useState<SessionInfo[]>([]);
-	const [selectedSession, setSelectedSession] = useState<SessionInfo | null>(null);
+	const [sessions, setSessions] = useState<Session[]>([]);
+	const [selectedSession, setSelectedSession] = useState<Session | null>(null);
 	const [entries, setEntries] = useState<ParsedEntry[]>([]);
 	const [tokens, setTokens] = useState<TokenStats | null>(null);
 	const [loading, setLoading] = useState(true);
@@ -18,16 +18,64 @@ export function App() {
 	const [expandThinking, setExpandThinking] = useState<boolean | null>(null);
 	const [expandToolCalls, setExpandToolCalls] = useState<boolean | null>(null);
 
-	// Pagination state
-	const [cursor, setCursor] = useState<number>(0);
-	const [hasMore, setHasMore] = useState(false);
-	const [loadingMore, setLoadingMore] = useState(false);
-	const selectedSessionRef = useRef<SessionInfo | null>(null);
+	// MRU (Most Recently Used) stack: ordered list of session IDs, index 0 = most recent
+	const [mruStack, setMruStack] = useState<string[]>([]);
+	// MRU cycling state: index in mruStack during Shift+Alt+Q cycling (null = not cycling)
+	const [mruCycleIndex, setMruCycleIndex] = useState<number | null>(null);
+	// Ref to track if modifiers are held (for cycling detection)
+	const mruModifiersHeldRef = useRef(false);
 
-	// Keep ref in sync with state for async callbacks
+	// Sidebar width with localStorage persistence
+	const [sidebarWidth, setSidebarWidth] = useState(() => {
+		const saved = localStorage.getItem('orbit-sidebar-width');
+		return saved ? Number.parseInt(saved, 10) : 260;
+	});
+
+	// Persist sidebar width to localStorage
 	useEffect(() => {
-		selectedSessionRef.current = selectedSession;
-	}, [selectedSession]);
+		localStorage.setItem('orbit-sidebar-width', String(sidebarWidth));
+	}, [sidebarWidth]);
+
+	// Session titles fetched via bash command
+	const [sessionTitles, setSessionTitles] = useState<Record<string, string | null>>({});
+
+	// Fetch session titles periodically if command is configured
+	useEffect(() => {
+		const command = config.sessionTitleCommand;
+		const intervalMs = config.sessionTitleIntervalMs || 15000;
+
+		if (!command || sessions.length === 0) return;
+
+		const fetchTitles = async () => {
+			try {
+				const sessionIds = sessions.map((s) => s.id);
+				const res = await fetch('/api/session-titles', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ sessionIds }),
+				});
+				if (res.ok) {
+					const data = (await res.json()) as { titles: Record<string, string | null> };
+					setSessionTitles(data.titles);
+				}
+			} catch {
+				// Ignore fetch errors
+			}
+		};
+
+		// Fetch immediately and then periodically
+		fetchTitles();
+		const interval = setInterval(fetchTitles, intervalMs);
+		return () => clearInterval(interval);
+	}, [sessions, config.sessionTitleCommand, config.sessionTitleIntervalMs]);
+
+	// SSE reconnect settings from config
+	const sseMaxRetries = config.sseMaxRetries;
+	const sseBaseDelayMs = config.sseBaseDelayMs;
+	const sseMaxDelayMs = config.sseMaxDelayMs;
+
+	// Ref to track current session ID (prevents cross-contamination during session switches)
+	const currentSessionIdRef = useRef<string | null>(null);
 
 	// Fetch sessions list
 	const fetchSessions = useCallback(async () => {
@@ -43,60 +91,38 @@ export function App() {
 		}
 	}, []);
 
-	// Initial fetch and periodic refresh (configurable interval)
+	// Initial fetch and periodic refresh
 	useEffect(() => {
 		fetchSessions();
-		// Poll interval from config (0 = disabled)
-		if (config.sessionPollInterval > 0) {
-			const interval = setInterval(fetchSessions, config.sessionPollInterval);
+		if (config.sessionPollIntervalMs > 0) {
+			const interval = setInterval(fetchSessions, config.sessionPollIntervalMs);
 			return () => clearInterval(interval);
 		}
-	}, [fetchSessions, config.sessionPollInterval]);
-
-	// Fetch more (older) entries when scrolling up
-	const fetchMoreEntries = useCallback(async () => {
-		const session = selectedSessionRef.current;
-		if (!session || !hasMore || loadingMore || cursor <= 0) return;
-
-		setLoadingMore(true);
-		try {
-			const res = await fetch(`/api/sessions/${session.id}/entries?limit=100&before=${cursor}`);
-			if (!res.ok) throw new Error('Failed to fetch');
-			const data = await res.json();
-
-			// Prepend older entries
-			setEntries((prev) => [...data.entries, ...prev]);
-			setCursor(data.cursor);
-			setHasMore(data.hasMore);
-		} catch {
-			// Fetch error - ignore
-		} finally {
-			setLoadingMore(false);
-		}
-	}, [hasMore, loadingMore, cursor]);
-
-	// SSE reconnect constants
-	const SSE_MAX_RETRIES = 10;
-	const SSE_BASE_DELAY_MS = 2000;
-	const SSE_MAX_DELAY_MS = 30000;
+	}, [fetchSessions, config.sessionPollIntervalMs]);
 
 	// SSE connection error state
 	const [sseError, setSseError] = useState<string | null>(null);
 
+	// Reload trigger - increment to force SSE reconnect
+	const [reloadTrigger, setReloadTrigger] = useState(0);
+
 	// Connect to SSE stream when session selected
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadTrigger intentionally triggers reconnect
 	useEffect(() => {
 		if (!selectedSession) {
+			currentSessionIdRef.current = null;
 			setEntries([]);
 			setTokens(null);
-			setCursor(0);
-			setHasMore(false);
 			setSseError(null);
 			return;
 		}
 
+		// Update ref immediately to prevent race conditions
+		currentSessionIdRef.current = selectedSession.id;
+
 		let eventSource: EventSource | null = null;
 		let retryCount = 0;
-		let isFirstInit = true; // Track first init vs reconnect
+		let isFirstInit = true;
 
 		const connect = () => {
 			eventSource = new EventSource(`/api/sessions/${selectedSession.id}/stream`);
@@ -105,49 +131,31 @@ export function App() {
 				try {
 					const data = JSON.parse(event.data);
 
-					// Verify session ID matches (avoid cross-session contamination during switch)
-					if (data.sessionId && data.sessionId !== selectedSession.id) {
+					// Check against ref (not closure) to prevent cross-contamination during session switches
+					if (data.sessionId && data.sessionId !== currentSessionIdRef.current) {
 						return;
 					}
 
-					// Reset retry count on successful message
 					retryCount = 0;
 					setSseError(null);
 
-					// Initial load (tail of transcript)
 					if (data.type === 'init') {
-						// First init: always set entries (even if empty - shows "No entries")
-						// Reconnect: only update if we have new entries (prevents flicker)
 						if (isFirstInit || data.entries.length > 0) {
 							setEntries(data.entries);
 							const stats = calculateTokens(data.entries);
 							setTokens(stats);
 						}
 						isFirstInit = false;
-						setCursor(data.cursor || 0);
-						setHasMore(data.hasMore || false);
 						setTranscriptLoading(false);
-					}
-					// Batch of new entries (debounced from server)
-					else if (data.type === 'batch' && Array.isArray(data.entries)) {
+					} else if (data.type === 'batch' && Array.isArray(data.entries)) {
 						const newEntries = data.entries as ParsedEntry[];
 						if (newEntries.length === 0) return;
 
-						// Single state update for all entries in batch
-						setEntries((prev) => {
-							const updated = [...prev, ...newEntries];
-							const maxEntries = config.maxEntriesInMemory;
-							if (maxEntries > 0 && updated.length > maxEntries) {
-								return updated.slice(-maxEntries);
-							}
-							return updated;
-						});
+						setEntries((prev) => [...prev, ...newEntries]);
 
-						// Single token stats update (reduce all entries, including turn count)
 						setTokens((prev) => {
 							let stats = prev;
 							for (const entry of newEntries) {
-								// Increment turn counter for user entries
 								if (entry.type === 'user') {
 									stats = { ...stats, turns: (stats?.turns || 0) + 1 } as typeof stats;
 								}
@@ -157,35 +165,9 @@ export function App() {
 							}
 							return stats;
 						});
-					}
-					// File truncation (rotation) - reload from server
-					else if (data.type === 'truncated') {
+					} else if (data.type === 'truncated') {
 						setEntries([]);
 						setTokens(null);
-						setCursor(0);
-						setHasMore(false);
-					}
-					// Legacy: single entry (backwards compatibility)
-					else if (data.type !== 'init' && data.type !== 'batch' && data.type !== 'truncated') {
-						setEntries((prev) => {
-							const updated = [...prev, data];
-							const maxEntries = config.maxEntriesInMemory;
-							if (maxEntries > 0 && updated.length > maxEntries) {
-								return updated.slice(-maxEntries);
-							}
-							return updated;
-						});
-						// Update tokens and turn count
-						setTokens((prev) => {
-							let stats = prev;
-							if (data.type === 'user') {
-								stats = { ...stats, turns: (stats?.turns || 0) + 1 } as typeof stats;
-							}
-							if (data.tokens) {
-								stats = updateTokenStats(stats, data.tokens);
-							}
-							return stats;
-						});
 					}
 				} catch {
 					// Parse error
@@ -196,15 +178,13 @@ export function App() {
 				eventSource?.close();
 
 				retryCount++;
-				if (retryCount > SSE_MAX_RETRIES) {
-					// Max retries exceeded - show error and stop
-					setSseError(`Connection lost after ${SSE_MAX_RETRIES} retries`);
+				if (retryCount > sseMaxRetries) {
+					setSseError(`Connection lost after ${sseMaxRetries} retries`);
 					setTranscriptLoading(false);
 					return;
 				}
 
-				// Exponential backoff: 2s, 4s, 8s, ... up to 30s
-				const delay = Math.min(SSE_BASE_DELAY_MS * 2 ** (retryCount - 1), SSE_MAX_DELAY_MS);
+				const delay = Math.min(sseBaseDelayMs * 2 ** (retryCount - 1), sseMaxDelayMs);
 				setTimeout(connect, delay);
 			};
 		};
@@ -214,16 +194,112 @@ export function App() {
 		return () => {
 			eventSource?.close();
 		};
-	}, [selectedSession, config.maxEntriesInMemory]);
+	}, [selectedSession, reloadTrigger, sseMaxRetries, sseBaseDelayMs, sseMaxDelayMs]);
 
-	const handleSelectSession = (session: SessionInfo) => {
+	const handleSelectSession = useCallback((session: Session) => {
 		setSelectedSession(session);
 		setEntries([]);
 		setTokens(null);
-		setCursor(0);
-		setHasMore(false);
 		setTranscriptLoading(true);
-	};
+
+		// Update MRU stack: move selected session to front
+		setMruStack((prev) => {
+			const filtered = prev.filter((id) => id !== session.id);
+			return [session.id, ...filtered];
+		});
+	}, []);
+
+	const handleReload = useCallback(() => {
+		setEntries([]);
+		setTokens(null);
+		setTranscriptLoading(true);
+		setReloadTrigger((prev) => prev + 1);
+	}, []);
+
+	// Sessions are already sorted by modification time from server (newest first)
+	const sortedSessions = sessions;
+
+	// Derive the session being previewed during MRU cycling
+	const mruCycleSession = useMemo(() => {
+		if (mruCycleIndex === null || mruStack.length < 2) return null;
+		const sessionId = mruStack[mruCycleIndex];
+		return sessions.find((s) => s.id === sessionId) ?? null;
+	}, [mruCycleIndex, mruStack, sessions]);
+
+	// Toggle handlers for expand states
+	const handleToggleExpandThinking = useCallback(() => {
+		setExpandThinking((prev) => (prev === null ? !config.defaultExpandThinking : !prev));
+	}, [config.defaultExpandThinking]);
+
+	const handleToggleExpandToolCalls = useCallback(() => {
+		setExpandToolCalls((prev) => (prev === null ? !config.defaultExpandToolCalls : !prev));
+	}, [config.defaultExpandToolCalls]);
+
+	// MRU cycling: commit selection when modifiers released
+	const commitMruSelection = useCallback(() => {
+		if (mruCycleIndex !== null && mruStack.length >= 2) {
+			const sessionId = mruStack[mruCycleIndex];
+			const session = sessions.find((s) => s.id === sessionId);
+			if (session) {
+				handleSelectSession(session);
+			}
+		}
+		setMruCycleIndex(null);
+		mruModifiersHeldRef.current = false;
+	}, [mruCycleIndex, mruStack, sessions, handleSelectSession]);
+
+	// Global keyboard shortcuts
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			// MRU cycling: Shift+Alt+Q
+			if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'q') {
+				e.preventDefault();
+
+				// Need at least 2 sessions to cycle
+				if (mruStack.length < 2) return;
+
+				mruModifiersHeldRef.current = true;
+
+				setMruCycleIndex((prev) => {
+					if (prev === null) {
+						// Start cycling at index 1 (previous session)
+						return 1;
+					}
+					// Advance to next, wrapping around
+					return (prev + 1) % mruStack.length;
+				});
+				return;
+			}
+
+			// Other shortcuts require Shift+Alt
+			if (!e.shiftKey || !e.altKey) return;
+
+			switch (e.key.toLowerCase()) {
+				case 't':
+					e.preventDefault();
+					handleToggleExpandThinking();
+					break;
+				case 'o':
+					e.preventDefault();
+					handleToggleExpandToolCalls();
+					break;
+			}
+		};
+
+		const handleKeyUp = (e: KeyboardEvent) => {
+			// Commit MRU selection when Shift or Alt is released
+			if (mruModifiersHeldRef.current && (e.key === 'Shift' || e.key === 'Alt')) {
+				commitMruSelection();
+			}
+		};
+
+		window.addEventListener('keydown', handleKeyDown);
+		window.addEventListener('keyup', handleKeyUp);
+		return () => {
+			window.removeEventListener('keydown', handleKeyDown);
+			window.removeEventListener('keyup', handleKeyUp);
+		};
+	}, [handleToggleExpandThinking, handleToggleExpandToolCalls, mruStack, commitMruSelection]);
 
 	if (loading) {
 		return (
@@ -249,10 +325,14 @@ export function App() {
 	return (
 		<div className="app">
 			<Sidebar
-				sessions={sessions}
+				sessions={sortedSessions}
 				selectedSession={selectedSession}
 				onSelectSession={handleSelectSession}
 				onRefresh={fetchSessions}
+				width={sidebarWidth}
+				onWidthChange={setSidebarWidth}
+				sessionTitles={sessionTitles}
+				mruCycleSession={mruCycleSession}
 			/>
 			<main className="main-content">
 				{selectedSession ? (
@@ -264,8 +344,7 @@ export function App() {
 									type="button"
 									onClick={() => {
 										setSseError(null);
-										setTranscriptLoading(true);
-										setSelectedSession({ ...selectedSession });
+										handleReload();
 									}}
 								>
 									Retry
@@ -274,22 +353,15 @@ export function App() {
 						)}
 						<TranscriptView
 							session={selectedSession}
+							sessionTitle={sessionTitles[selectedSession.id] ?? null}
 							entries={entries}
 							tokens={tokens}
-							hasMore={hasMore}
-							loadingMore={loadingMore}
 							transcriptLoading={transcriptLoading}
-							onLoadMore={fetchMoreEntries}
+							onReload={handleReload}
 							expandThinking={expandThinking}
 							expandToolCalls={expandToolCalls}
-							onToggleExpandThinking={() =>
-								setExpandThinking((prev) => (prev === null ? !config.defaultExpandThinking : !prev))
-							}
-							onToggleExpandToolCalls={() =>
-								setExpandToolCalls((prev) =>
-									prev === null ? !config.defaultExpandToolCalls : !prev,
-								)
-							}
+							onToggleExpandThinking={handleToggleExpandThinking}
+							onToggleExpandToolCalls={handleToggleExpandToolCalls}
 						/>
 					</>
 				) : (
@@ -303,7 +375,6 @@ export function App() {
 	);
 }
 
-// Helper to calculate tokens from entries
 function calculateTokens(entries: ParsedEntry[]): TokenStats {
 	const stats: TokenStats = {
 		totalInputTokens: 0,
@@ -334,7 +405,6 @@ function calculateTokens(entries: ParsedEntry[]): TokenStats {
 	return stats;
 }
 
-// Helper to update token stats
 function updateTokenStats(prev: TokenStats | null, usage: ParsedEntry['tokens']): TokenStats {
 	const stats = prev || {
 		totalInputTokens: 0,

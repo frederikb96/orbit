@@ -13,16 +13,11 @@ import type {
 	TokenStats,
 	TokenUsage,
 	TranscriptEntry,
-} from '../types/index.ts';
-
-// Re-export shared formatters for convenience
-export { formatNumber, formatTime, formatToolInput } from '../shared/formatters.ts';
-
-// Default entries to load initially and per page
-export const DEFAULT_LIMIT = 100;
+} from '../types.ts';
 
 /**
- * Parse a single JSONL line into a ParsedEntry
+ * Parse a single JSONL line into a ParsedEntry.
+ *
  * @param line - JSONL line content
  * @param toolMap - Map of tool use IDs to tool names (for matching results)
  * @param byteOffset - Byte offset of line start in file (for stable ID generation)
@@ -42,7 +37,6 @@ export function parseEntry(
 		return null;
 	}
 
-	// Use byte offset for stable, unique ID across pagination loads
 	const id = `entry-${byteOffset}`;
 	const timestamp = entry.timestamp || new Date().toISOString();
 
@@ -118,7 +112,6 @@ export function parseEntry(
 					input: block.input || {},
 				};
 				toolCalls.push(toolCall);
-				// Store for matching with results
 				if (block.id && block.name) {
 					toolMap.set(block.id, block.name);
 				}
@@ -142,7 +135,6 @@ export function parseEntry(
 			const hookInfos = entry.hookInfos || [];
 			const hookErrors = entry.hookErrors || [];
 
-			// Only include if interesting
 			if (hookErrors.length > 0 || hookInfos.length > 1 || entry.preventedContinuation) {
 				const hookNames = hookInfos.map((info) => {
 					const cmd = info.command || '';
@@ -172,9 +164,12 @@ export function parseEntry(
 }
 
 /**
- * Parse entire transcript file (for small files or full sync)
+ * Parse entire transcript file.
  */
-export function parseTranscript(content: string): { entries: ParsedEntry[]; tokens: TokenStats } {
+export function parseTranscript(content: string): {
+	entries: ParsedEntry[];
+	tokens: TokenStats;
+} {
 	const lines = content.split('\n');
 	const entries: ParsedEntry[] = [];
 	const toolMap = new Map<string, string>();
@@ -193,7 +188,6 @@ export function parseTranscript(content: string): { entries: ParsedEntry[]; toke
 		if (entry) {
 			entries.push(entry);
 
-			// Track tokens
 			if (entry.type === 'assistant' && entry.tokens) {
 				updateTokens(tokens, entry.tokens);
 			}
@@ -201,7 +195,6 @@ export function parseTranscript(content: string): { entries: ParsedEntry[]; toke
 				tokens.turns++;
 			}
 		}
-		// Account for line + newline
 		byteOffset += Buffer.byteLength(line, 'utf8') + 1;
 	}
 
@@ -214,7 +207,7 @@ interface LineWithOffset {
 }
 
 /**
- * Build index of lines with their byte offsets
+ * Build index of lines with their byte offsets.
  */
 function buildLineIndex(content: string): LineWithOffset[] {
 	const result: LineWithOffset[] = [];
@@ -233,15 +226,14 @@ function buildLineIndex(content: string): LineWithOffset[] {
 
 /**
  * Parse the tail (most recent entries) of a transcript file.
- * Reads file and returns last N entries with proper byte offsets for stable IDs.
  *
  * @param filePath - Path to the JSONL transcript file
- * @param limit - Maximum entries to return
+ * @param limit - Maximum entries to return (0 = no limit, load all)
  * @param beforeByte - Load entries starting before this byte position (for pagination)
  */
 export async function parseTranscriptTail(
 	filePath: string,
-	limit = DEFAULT_LIMIT,
+	limit: number,
 	beforeByte?: number,
 ): Promise<PaginatedEntries> {
 	const file = Bun.file(filePath);
@@ -251,22 +243,20 @@ export async function parseTranscriptTail(
 		return { entries: [], cursor: 0, hasMore: false };
 	}
 
-	// For pagination, read only up to beforeByte position
 	const endPos = beforeByte ?? fileSize;
 	const content = await file.slice(0, endPos).text();
 
-	// Build line index with byte offsets
 	const lineIndex = buildLineIndex(content);
 
 	if (lineIndex.length === 0) {
 		return { entries: [], cursor: 0, hasMore: false };
 	}
 
-	// Get the last `limit` lines
-	const startIdx = Math.max(0, lineIndex.length - limit);
+	// 0 = no limit, load all entries
+	const effectiveLimit = limit === 0 ? lineIndex.length : limit;
+	const startIdx = Math.max(0, lineIndex.length - effectiveLimit);
 	const linesToParse = lineIndex.slice(startIdx);
 
-	// Parse entries with their actual byte offsets
 	const toolMap = new Map<string, string>();
 	const entries: ParsedEntry[] = [];
 
@@ -277,13 +267,10 @@ export async function parseTranscriptTail(
 		}
 	}
 
-	// Calculate cursor for loading older entries
 	const hasMore = startIdx > 0;
 	let cursor = 0;
 
 	if (hasMore && linesToParse.length > 0) {
-		// Cursor is the byte offset of the first returned entry
-		// Next pagination call should read file up to this position
 		cursor = linesToParse[0].byteOffset;
 	}
 
@@ -291,7 +278,7 @@ export async function parseTranscriptTail(
 }
 
 /**
- * Update token stats from usage
+ * Update token stats from usage.
  */
 export function updateTokens(stats: TokenStats, usage: TokenUsage): void {
 	const input = Number(usage.input_tokens) || 0;
@@ -304,12 +291,11 @@ export function updateTokens(stats: TokenStats, usage: TokenUsage): void {
 	if (cacheCreate > 0) stats.totalCacheCreationTokens += cacheCreate;
 	if (cacheRead > 0) stats.totalCacheReadTokens += cacheRead;
 
-	// Current context = input + cache tokens from this turn
 	stats.currentContextTokens = input + cacheCreate + cacheRead;
 }
 
 /**
- * Streaming parser for incremental updates (SSE)
+ * Streaming parser for incremental updates (SSE).
  */
 export class StreamingParser {
 	private buffer = '';
@@ -321,29 +307,34 @@ export class StreamingParser {
 	}
 
 	/**
-	 * Set the byte offset for the next entries
+	 * Set the byte offset for the next entries.
 	 */
 	setByteOffset(offset: number): void {
 		this.currentByteOffset = offset;
 	}
 
 	/**
-	 * Parse new content and return new entries
+	 * Get the current byte offset.
+	 */
+	getByteOffset(): number {
+		return this.currentByteOffset;
+	}
+
+	/**
+	 * Parse new content and return new entries.
 	 */
 	parse(newContent: string): ParsedEntry[] {
 		this.buffer += newContent;
 		const entries: ParsedEntry[] = [];
 
-		// Process complete lines
 		const lines = this.buffer.split('\n');
-		this.buffer = lines.pop() || ''; // Keep incomplete line
+		this.buffer = lines.pop() || '';
 
 		for (const line of lines) {
 			const entry = parseEntry(line, this.toolMap, this.currentByteOffset);
 			if (entry) {
 				entries.push(entry);
 			}
-			// Update byte offset for next line
 			this.currentByteOffset += Buffer.byteLength(line, 'utf8') + 1;
 		}
 
@@ -351,7 +342,7 @@ export class StreamingParser {
 	}
 
 	/**
-	 * Reset parser state
+	 * Reset parser state.
 	 */
 	reset(): void {
 		this.buffer = '';

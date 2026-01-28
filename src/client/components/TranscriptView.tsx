@@ -1,17 +1,15 @@
-import { useVirtualizer } from '@tanstack/react-virtual';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatNumber, formatTime, formatToolInput } from '../../shared/formatters.ts';
-import type { ParsedEntry, ParsedToolResult, SessionInfo, TokenStats } from '../../types/index.ts';
+import type { ParsedEntry, ParsedToolResult, Session, TokenStats } from '../../types.ts';
 import { useConfig } from '../ConfigContext.tsx';
 
 interface TranscriptViewProps {
-	session: SessionInfo;
+	session: Session;
+	sessionTitle: string | null;
 	entries: ParsedEntry[];
 	tokens: TokenStats | null;
-	hasMore: boolean;
-	loadingMore: boolean;
 	transcriptLoading: boolean;
-	onLoadMore: () => void;
+	onReload: () => void;
 	expandThinking: boolean | null;
 	expandToolCalls: boolean | null;
 	onToggleExpandThinking: () => void;
@@ -20,35 +18,34 @@ interface TranscriptViewProps {
 
 export function TranscriptView({
 	session,
+	sessionTitle,
 	entries,
 	tokens,
-	hasMore,
-	loadingMore,
 	transcriptLoading,
-	onLoadMore,
+	onReload,
 	expandThinking,
 	expandToolCalls,
 	onToggleExpandThinking,
 	onToggleExpandToolCalls,
 }: TranscriptViewProps) {
 	const { config } = useConfig();
-	const [autoScroll, setAutoScroll] = useState(true);
-	const parentRef = useRef<HTMLDivElement>(null);
-	const prevEntriesCountRef = useRef(entries.length);
-	const prevFirstEntryIdRef = useRef<string | null>(null);
-	const isLoadingMoreRef = useRef(false);
+	const containerRef = useRef<HTMLDivElement>(null);
+	const lastScrollTopRef = useRef(0);
+	const [currentPage, setCurrentPage] = useState(1);
+	const [shouldAutoscroll, setShouldAutoscroll] = useState(true);
+
+	const pageSize = config.pageSize || 500;
 
 	// Effective expand state (null means use config default)
 	const effectiveExpandThinking = expandThinking ?? config.defaultExpandThinking;
 	const effectiveExpandToolCalls = expandToolCalls ?? config.defaultExpandToolCalls;
 
-	// Build tool result map (stored in ref for stable reference) and filter displayable entries
+	// Build tool result map and filter displayable entries
 	const toolResultMapRef = useRef<Map<string, ParsedToolResult>>(new Map());
 	const displayEntries = useMemo(() => {
 		const resultMap = new Map<string, ParsedToolResult>();
 		const toolCallIds = new Set<string>();
 
-		// First pass: collect all tool call IDs and tool results
 		for (const entry of entries) {
 			if (entry.type === 'tool_result' && entry.toolResult) {
 				resultMap.set(entry.toolResult.toolUseId, entry.toolResult);
@@ -60,10 +57,8 @@ export function TranscriptView({
 			}
 		}
 
-		// Update ref with new map
 		toolResultMapRef.current = resultMap;
 
-		// Second pass: filter out tool_results that are consumed by their tool calls
 		return entries.filter((entry) => {
 			if (entry.type === 'tool_result' && entry.toolResult) {
 				return !toolCallIds.has(entry.toolResult.toolUseId);
@@ -72,106 +67,147 @@ export function TranscriptView({
 		});
 	}, [entries]);
 
-	// Stable callback for looking up tool results (avoids prop reference changes)
+	// Stable callback for looking up tool results
 	const getToolResult = useCallback(
 		(toolUseId: string): ParsedToolResult | undefined => toolResultMapRef.current.get(toolUseId),
 		[],
 	);
 
-	// Virtualizer for efficient rendering
-	const virtualizer = useVirtualizer({
-		count: displayEntries.length,
-		getScrollElement: () => parentRef.current,
-		estimateSize: () => 200, // Estimate largest expected height (reduces re-measurement)
-		overscan: 5, // Render 5 extra items above/below viewport
-		getItemKey: (index) => displayEntries[index]?.id ?? index,
-		// Disable synchronous layout flush - critical for high-frequency updates
-		useFlushSync: false,
-	});
+	// Calculate pagination
+	const totalEntries = displayEntries.length;
+	const totalPages = Math.max(1, Math.ceil(totalEntries / pageSize));
 
-	// Handle entries being prepended (when loading older)
+	// Page 1 is special: it's the LAST entries (newest) and can grow
+	// Other pages are static slices from the beginning
+	const getPageEntries = useCallback(() => {
+		if (totalEntries === 0) return [];
+
+		if (currentPage === 1) {
+			// Page 1: newest entries (from end)
+			const startIdx = Math.max(0, totalEntries - pageSize);
+			return displayEntries.slice(startIdx);
+		}
+		// Other pages: older entries (from beginning), reverse page numbering
+		const reversePageIdx = totalPages - currentPage;
+		const startIdx = reversePageIdx * pageSize;
+		const endIdx = Math.min(startIdx + pageSize, totalEntries);
+		return displayEntries.slice(startIdx, endIdx);
+	}, [displayEntries, totalEntries, totalPages, currentPage, pageSize]);
+
+	const pageEntries = getPageEntries();
+
+	// Auto-reload when page 1 exceeds 2x pageSize
+	const page1Size = currentPage === 1 ? pageEntries.length : 0;
+	const maxPage1Size = pageSize * 2;
+
 	useEffect(() => {
-		const prevCount = prevEntriesCountRef.current;
-		const prevFirstId = prevFirstEntryIdRef.current;
+		if (currentPage === 1 && page1Size > maxPage1Size) {
+			onReload();
+		}
+	}, [currentPage, page1Size, maxPage1Size, onReload]);
 
-		if (displayEntries.length > 0) {
-			const currentFirstId = displayEntries[0].id;
+	// Reset to page 1 on session change
+	// biome-ignore lint/correctness/useExhaustiveDependencies: session.id intentionally triggers reset
+	useEffect(() => {
+		setCurrentPage(1);
+		setShouldAutoscroll(true);
+		lastScrollTopRef.current = 0;
+	}, [session.id]);
 
-			// Check if entries were prepended (new first entry ID)
-			if (prevFirstId && prevFirstId !== currentFirstId && displayEntries.length > prevCount) {
-				// Find the index of what was previously the first entry
-				const previousFirstIndex = displayEntries.findIndex((e) => e.id === prevFirstId);
+	// Autoscroll: direction-based detection
+	// scrollTop decreased → user scrolled up → disable
+	// at bottom → re-enable
+	const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+		const { scrollTop, scrollHeight, offsetHeight } = e.currentTarget;
+		const isAtBottom = scrollHeight - scrollTop - offsetHeight < 50;
 
-				if (previousFirstIndex > 0 && isLoadingMoreRef.current) {
-					// Scroll to maintain position after prepend
-					requestAnimationFrame(() => {
-						virtualizer.scrollToIndex(previousFirstIndex, { align: 'start' });
-					});
-					isLoadingMoreRef.current = false;
-				}
-			}
-
-			prevFirstEntryIdRef.current = currentFirstId;
+		if (scrollTop < lastScrollTopRef.current && !isAtBottom) {
+			setShouldAutoscroll(false);
+		} else if (isAtBottom) {
+			setShouldAutoscroll(true);
 		}
 
-		prevEntriesCountRef.current = displayEntries.length;
-	}, [displayEntries, virtualizer]);
-
-	// Auto-scroll to bottom on new entries at end (using RAF + direct DOM, not state)
-	useEffect(() => {
-		if (autoScroll && displayEntries.length > 0 && !isLoadingMoreRef.current) {
-			requestAnimationFrame(() => {
-				const el = parentRef.current;
-				if (el) {
-					el.scrollTop = el.scrollHeight;
-				}
-			});
-		}
-	}, [displayEntries.length, autoScroll]);
-
-	// Throttled scroll handler
-	const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const handleScroll = useCallback(() => {
-		if (scrollTimeoutRef.current) return;
-
-		scrollTimeoutRef.current = setTimeout(() => {
-			scrollTimeoutRef.current = null;
-
-			const scrollEl = parentRef.current;
-			if (!scrollEl) return;
-
-			const { scrollTop, scrollHeight, clientHeight } = scrollEl;
-
-			// Check if at bottom for auto-scroll (strict: only when truly at end)
-			const isAtBottom = scrollHeight - scrollTop - clientHeight < 5;
-			setAutoScroll(isAtBottom);
-
-			// Load more when near top
-			if (scrollTop < 300 && hasMore && !loadingMore && !isLoadingMoreRef.current) {
-				isLoadingMoreRef.current = true;
-				onLoadMore();
-			}
-		}, 50); // Throttle to 50ms
-	}, [hasMore, loadingMore, onLoadMore]);
-
-	// Cleanup throttle timeout on unmount
-	useEffect(() => {
-		return () => {
-			if (scrollTimeoutRef.current) {
-				clearTimeout(scrollTimeoutRef.current);
-			}
-		};
+		lastScrollTopRef.current = scrollTop;
 	}, []);
 
-	const virtualItems = virtualizer.getVirtualItems();
+	// Autoscroll: scroll to bottom when new entries arrive (on page 1)
+	// biome-ignore lint/correctness/useExhaustiveDependencies: entries.length intentionally triggers scroll
+	useEffect(() => {
+		if (shouldAutoscroll && currentPage === 1 && containerRef.current) {
+			containerRef.current.scrollTop = containerRef.current.scrollHeight;
+		}
+	}, [entries.length, shouldAutoscroll, currentPage]);
+
+	// Manual autoscroll toggle (for button click)
+	const handleAutoscrollToggle = useCallback(() => {
+		const newValue = !shouldAutoscroll;
+		setShouldAutoscroll(newValue);
+		if (newValue && containerRef.current) {
+			containerRef.current.scrollTop = containerRef.current.scrollHeight;
+		}
+	}, [shouldAutoscroll]);
+
+	// Enable autoscroll and scroll to bottom (for keyboard shortcut)
+	const handleAutoscrollEnable = useCallback(() => {
+		setShouldAutoscroll(true);
+		if (containerRef.current) {
+			containerRef.current.scrollTop = containerRef.current.scrollHeight;
+		}
+	}, []);
+
+	// Page navigation
+	const handlePrevPage = useCallback(() => {
+		if (currentPage < totalPages) {
+			setCurrentPage((p) => p + 1);
+			setShouldAutoscroll(false);
+		}
+	}, [currentPage, totalPages]);
+
+	const handleNextPage = useCallback(() => {
+		if (currentPage > 1) {
+			setCurrentPage((p) => p - 1);
+			if (currentPage === 2) {
+				setShouldAutoscroll(true);
+			}
+		}
+	}, [currentPage]);
+
+	const handleReload = useCallback(() => {
+		setCurrentPage(1);
+		setShouldAutoscroll(true);
+		lastScrollTopRef.current = 0;
+		onReload();
+	}, [onReload]);
+
+	// Keyboard shortcuts (transcript-specific)
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (!e.shiftKey || !e.altKey) return;
+
+			switch (e.key.toLowerCase()) {
+				case 's':
+					e.preventDefault();
+					handleAutoscrollEnable();
+					break;
+				case 'r':
+					e.preventDefault();
+					handleReload();
+					break;
+			}
+		};
+
+		window.addEventListener('keydown', handleKeyDown);
+		return () => window.removeEventListener('keydown', handleKeyDown);
+	}, [handleAutoscrollEnable, handleReload]);
 
 	return (
 		<div className="transcript-view">
 			<header className="transcript-header">
 				<div className="header-info">
 					<span className="session-type-badge">{session.type}</span>
+					{sessionTitle && <span className="session-title">{sessionTitle}</span>}
 					<span className="session-id">{session.id}</span>
-					{session.active && <span className="active-badge">⚡ Active</span>}
+					{session.active && <span className="active-badge">&#x26A1; Active</span>}
 				</div>
 				{tokens && (
 					<div className="token-stats">
@@ -186,90 +222,89 @@ export function TranscriptView({
 						type="button"
 						className={`expand-toggle ${effectiveExpandThinking ? 'active' : ''}`}
 						onClick={onToggleExpandThinking}
-						title={
-							effectiveExpandThinking
-								? 'Thinking expanded (click to collapse)'
-								: 'Thinking collapsed (click to expand)'
-						}
+						title={`${effectiveExpandThinking ? 'Thinking expanded' : 'Thinking collapsed'} (Shift+Alt+T)`}
 					>
-						💭 {effectiveExpandThinking ? 'Expanded' : 'Collapsed'}
+						&#x1F4AD; {effectiveExpandThinking ? 'Expanded' : 'Collapsed'}
 					</button>
 					<button
 						type="button"
 						className={`expand-toggle ${effectiveExpandToolCalls ? 'active' : ''}`}
 						onClick={onToggleExpandToolCalls}
-						title={
-							effectiveExpandToolCalls
-								? 'Tools expanded (click to collapse)'
-								: 'Tools collapsed (click to expand)'
-						}
+						title={`${effectiveExpandToolCalls ? 'Tools expanded' : 'Tools collapsed'} (Shift+Alt+O)`}
 					>
-						🔧 {effectiveExpandToolCalls ? 'Expanded' : 'Collapsed'}
+						&#x1F527; {effectiveExpandToolCalls ? 'Expanded' : 'Collapsed'}
 					</button>
 				</div>
 				<button
 					type="button"
-					className={`auto-scroll-btn ${autoScroll ? 'active' : ''}`}
-					onClick={() => setAutoScroll(!autoScroll)}
-					title={autoScroll ? 'Auto-scroll ON' : 'Auto-scroll OFF'}
+					className="reload-btn"
+					onClick={handleReload}
+					title="Reload transcript (Shift+Alt+R)"
 				>
-					{autoScroll ? '↓' : '⏸'}
+					&#x1F504;
+				</button>
+				<button
+					type="button"
+					className={`auto-scroll-btn ${shouldAutoscroll ? 'active' : ''}`}
+					onClick={handleAutoscrollToggle}
+					title={`Auto-scroll ${shouldAutoscroll ? 'ON' : 'OFF'} (Shift+Alt+S to enable)`}
+				>
+					{shouldAutoscroll ? '\u2193' : '\u23F8'}
 				</button>
 			</header>
 
-			<div
-				className="entries-container"
-				ref={parentRef}
-				onScroll={handleScroll}
-				style={{ contain: 'strict' }}
-			>
-				{loadingMore && (
-					<div className="loading-more">
-						<div className="spinner-small" />
-						Loading older entries...
-					</div>
-				)}
-				{hasMore && !loadingMore && <div className="load-more-hint">↑ Scroll up to load more</div>}
-
+			<div className="entries-container" ref={containerRef} onScroll={handleScroll}>
 				{transcriptLoading ? (
 					<div className="loading-entries">Loading transcript...</div>
-				) : displayEntries.length === 0 ? (
+				) : pageEntries.length === 0 ? (
 					<div className="empty-transcript">No entries in this transcript</div>
 				) : (
-					<div
-						style={{
-							height: `${virtualizer.getTotalSize()}px`,
-							width: '100%',
-							position: 'relative',
-						}}
-					>
-						{virtualItems.map((virtualRow) => {
-							const entry = displayEntries[virtualRow.index];
-							return (
-								<div
-									key={virtualRow.key}
-									data-index={virtualRow.index}
-									ref={virtualizer.measureElement}
-									style={{
-										position: 'absolute',
-										top: 0,
-										left: 0,
-										width: '100%',
-										transform: `translateY(${virtualRow.start}px)`,
-									}}
-								>
-									<MemoizedEntryCard
-										entry={entry}
-										expandThinking={effectiveExpandThinking}
-										expandToolCalls={effectiveExpandToolCalls}
-										getToolResult={getToolResult}
-									/>
-								</div>
-							);
-						})}
-					</div>
+					pageEntries.map((entry) => (
+						<MemoizedEntryCard
+							key={entry.id}
+							entry={entry}
+							expandThinking={effectiveExpandThinking}
+							expandToolCalls={effectiveExpandToolCalls}
+							getToolResult={getToolResult}
+						/>
+					))
 				)}
 			</div>
+
+			<footer className="pagination-footer">
+				{totalPages > 1 && (
+					<button
+						type="button"
+						className="page-btn"
+						onClick={handlePrevPage}
+						disabled={currentPage >= totalPages}
+						title="View older entries"
+					>
+						&#x25C0; Older
+					</button>
+				)}
+				<span className="page-info">
+					{totalPages > 1 ? (
+						<>
+							Page {currentPage} of {totalPages} ({totalEntries} total, showing {pageEntries.length}
+							)
+						</>
+					) : (
+						<>{totalEntries} entries</>
+					)}
+				</span>
+				{totalPages > 1 && (
+					<button
+						type="button"
+						className="page-btn"
+						onClick={handleNextPage}
+						disabled={currentPage <= 1}
+						title="View newer entries"
+					>
+						Newer &#x25B6;
+					</button>
+				)}
+			</footer>
 		</div>
 	);
 }
@@ -300,8 +335,6 @@ const MemoizedEntryCard = memo(function EntryCard({
 				/>
 			);
 		case 'tool_result':
-			// Standalone tool_result entries (not consumed by a tool call) are already
-			// filtered to displayEntries, so we always render them here
 			return <MemoizedToolResultEntry entry={entry} expanded={expandToolCalls} />;
 		case 'system':
 			return <MemoizedSystemEntry entry={entry} />;
@@ -352,7 +385,7 @@ const MemoizedAssistantEntry = memo(function AssistantEntry({
 
 			{entry.thinking && (
 				<details className="thinking-block" open={expandThinking}>
-					<summary>💭 Thinking...</summary>
+					<summary>&#x1F4AD; Thinking...</summary>
 					<pre>{entry.thinking}</pre>
 				</details>
 			)}
@@ -390,7 +423,6 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 	expanded,
 	result,
 }: ToolCallBlockProps) {
-	// Memoize the expensive formatToolInput call
 	const { summary, details } = useMemo(
 		() => formatToolInput(tool.name, tool.input),
 		[tool.name, tool.input],
@@ -399,20 +431,20 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 	return (
 		<details className="tool-call" open={expanded}>
 			<summary className="tool-name">
-				🔧 <span className="name">[{tool.name}]</span> {summary}
+				&#x1F527; <span className="name">[{tool.name}]</span> {summary}
 				{result && (
 					<span
 						className={`result-indicator ${result.isError ? 'error' : 'success'}`}
 						aria-label={result.isError ? 'Error' : 'Success'}
 					>
-						{result.isError ? ' ❌' : ' ✓'}
+						{result.isError ? ' \u274C' : ' \u2713'}
 					</span>
 				)}
 			</summary>
 			{details && <pre className="tool-details">{details}</pre>}
 			{result && (
 				<div className={`tool-result-inline ${result.isError ? 'error' : ''}`}>
-					<div className="result-header">{result.isError ? '❌ Error' : '✓ Result'}</div>
+					<div className="result-header">{result.isError ? '\u274C Error' : '\u2713 Result'}</div>
 					<pre className="result-content">{result.content}</pre>
 				</div>
 			)}
@@ -430,7 +462,9 @@ const MemoizedToolResultEntry = memo(function ToolResultEntry({
 	return (
 		<details className={`entry tool-result-entry ${result.isError ? 'error' : ''}`} open={expanded}>
 			<summary className="result-summary">
-				<span aria-label={result.isError ? 'Error' : 'Success'}>{result.isError ? '❌' : '✓'}</span>{' '}
+				<span aria-label={result.isError ? 'Error' : 'Success'}>
+					{result.isError ? '\u274C' : '\u2713'}
+				</span>{' '}
 				[{result.toolName}] Result
 			</summary>
 			<pre className="result-content">{result.content}</pre>
@@ -447,7 +481,7 @@ const MemoizedSystemEntry = memo(function SystemEntry({ entry }: { entry: Parsed
 			<div className="entry-header">
 				<span className="role-badge system">HOOK</span>
 				<span className="hook-names">{hook.hookNames.join(', ')}</span>
-				{hook.hasErrors && <span className="error-badge">⚠️</span>}
+				{hook.hasErrors && <span className="error-badge">&#x26A0;</span>}
 			</div>
 			{hook.errors.length > 0 && (
 				<ul className="hook-errors">

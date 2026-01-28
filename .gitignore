@@ -1,3 +1,4 @@
+.archive/
 .claude/
 node_modules/
 public/bundle.js

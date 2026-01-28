@@ -10,8 +10,7 @@ interface State {
 }
 
 /**
- * Error boundary to catch rendering errors and show a fallback UI
- * instead of a white screen.
+ * Error boundary to catch rendering errors and show a fallback UI.
  */
 export class ErrorBoundary extends Component<Props, State> {
 	constructor(props: Props) {

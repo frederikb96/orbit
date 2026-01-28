@@ -87,13 +87,31 @@ body {
 
 /* Sidebar */
 .sidebar {
-	width: var(--sidebar-width);
 	height: 100%;
 	background: var(--bg-secondary);
 	border-right: 1px solid var(--border-default);
 	display: flex;
 	flex-direction: column;
 	overflow: hidden;
+	position: relative;
+	flex-shrink: 0;
+}
+
+.resize-handle {
+	position: absolute;
+	top: 0;
+	right: 0;
+	width: 4px;
+	height: 100%;
+	cursor: col-resize;
+	background: transparent;
+	transition: background 0.15s;
+	z-index: 10;
+}
+
+.resize-handle:hover,
+.resize-handle.active {
+	background: var(--accent-blue);
 }
 
 .sidebar-header {
@@ -117,7 +135,13 @@ body {
 	color: var(--accent-cyan);
 }
 
-.refresh-btn {
+.header-actions {
+	display: flex;
+	gap: 0.25rem;
+}
+
+.refresh-btn,
+.sort-btn {
 	background: transparent;
 	border: none;
 	color: var(--text-secondary);
@@ -126,11 +150,21 @@ body {
 	padding: 0.25rem;
 	border-radius: 4px;
 	transition: all 0.15s;
+	width: 28px;
+	height: 28px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
 }
 
-.refresh-btn:hover {
+.refresh-btn:hover,
+.sort-btn:hover {
 	background: var(--bg-hover);
 	color: var(--text-primary);
+}
+
+.sort-btn.active {
+	color: var(--accent-cyan);
 }
 
 /* Session Groups */
@@ -176,6 +210,21 @@ body {
 	border-left: 2px solid var(--accent-blue);
 }
 
+.session-item.mru-preview {
+	background: var(--bg-tertiary);
+	border-left: 2px dashed var(--accent-cyan);
+	animation: mru-pulse 0.5s ease-in-out infinite alternate;
+}
+
+@keyframes mru-pulse {
+	from {
+		background: var(--bg-tertiary);
+	}
+	to {
+		background: rgba(57, 197, 207, 0.15);
+	}
+}
+
 .session-item.active .session-id {
 	color: var(--accent-green);
 }
@@ -189,6 +238,9 @@ body {
 	font-family: var(--font-mono);
 	font-size: 0.85rem;
 	color: var(--text-primary);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 
 .session-time {
@@ -257,10 +309,19 @@ body {
 	text-transform: uppercase;
 }
 
+.transcript-header .session-title {
+	font-weight: 600;
+	color: var(--text-primary);
+	max-width: 300px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
 .transcript-header .session-id {
 	font-family: var(--font-mono);
-	font-size: 0.85rem;
-	color: var(--text-secondary);
+	font-size: 0.75rem;
+	color: var(--text-muted);
 }
 
 .active-badge {
@@ -748,4 +809,66 @@ button:focus-visible {
 
 .sse-error button:hover {
 	opacity: 0.9;
+}
+
+.empty-transcript {
+	padding: 2rem;
+	text-align: center;
+	color: var(--text-muted);
+}
+
+/* Reload Button */
+.reload-btn {
+	background: transparent;
+	border: 1px solid var(--border-default);
+	color: var(--text-secondary);
+	width: 32px;
+	height: 32px;
+	border-radius: 4px;
+	cursor: pointer;
+	font-size: 1rem;
+	transition: all 0.15s;
+}
+
+.reload-btn:hover {
+	background: var(--bg-hover);
+	color: var(--text-primary);
+}
+
+/* Pagination Footer */
+.pagination-footer {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 1rem;
+	padding: 0.75rem 1rem;
+	background: var(--bg-secondary);
+	border-top: 1px solid var(--border-default);
+}
+
+.page-btn {
+	background: var(--bg-tertiary);
+	border: 1px solid var(--border-default);
+	color: var(--text-secondary);
+	padding: 0.5rem 1rem;
+	border-radius: 4px;
+	cursor: pointer;
+	font-size: 0.85rem;
+	transition: all 0.15s;
+}
+
+.page-btn:hover:not(:disabled) {
+	background: var(--bg-hover);
+	color: var(--text-primary);
+}
+
+.page-btn:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.page-info {
+	font-family: var(--font-mono);
+	font-size: 0.85rem;
+	color: var(--text-secondary);
 }

@@ -1,13 +1,6 @@
 import { type ReactNode, createContext, useContext, useEffect, useState } from 'react';
-import type { UIConfig } from '../types/index.ts';
-
-const DEFAULT_UI_CONFIG: UIConfig = {
-	defaultExpandThinking: false,
-	defaultExpandToolCalls: false,
-	maxEntriesInMemory: 0,
-	maxSessions: 10,
-	sessionPollInterval: 5_000,
-};
+import { DEFAULT_UI_CONFIG } from '../shared/defaults.ts';
+import type { UIConfig } from '../types.ts';
 
 interface ConfigContextValue {
 	config: UIConfig;
@@ -34,7 +27,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 				setLoading(false);
 			})
 			.catch(() => {
-				// Use defaults on error
 				setLoading(false);
 			});
 	}, []);

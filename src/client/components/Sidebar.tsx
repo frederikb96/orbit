@@ -1,34 +1,95 @@
-import type React from 'react';
-import type { SessionInfo } from '../../types/index.ts';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { Session } from '../../types.ts';
+import { useConfig } from '../ConfigContext.tsx';
+
+const MIN_WIDTH = 180;
+const MAX_WIDTH = 500;
 
 interface SidebarProps {
-	sessions: SessionInfo[];
-	selectedSession: SessionInfo | null;
-	onSelectSession: (session: SessionInfo) => void;
+	sessions: Session[];
+	selectedSession: Session | null;
+	onSelectSession: (session: Session) => void;
 	onRefresh: () => void;
+	width: number;
+	onWidthChange: (width: number) => void;
+	sessionTitles: Record<string, string | null>;
+	mruCycleSession: Session | null;
 }
 
-export function Sidebar({ sessions, selectedSession, onSelectSession, onRefresh }: SidebarProps) {
+export function Sidebar({
+	sessions,
+	selectedSession,
+	onSelectSession,
+	onRefresh,
+	width,
+	onWidthChange,
+	sessionTitles,
+	mruCycleSession,
+}: SidebarProps) {
+	const { config } = useConfig();
+	const [isResizing, setIsResizing] = useState(false);
+	const startXRef = useRef(0);
+	const startWidthRef = useRef(0);
+
 	// Group sessions by active/recent
 	const activeSessions = sessions.filter((s) => s.active);
-	const recentSessions = sessions.filter((s) => !s.active).slice(0, 20);
+	const recentSessions = sessions.filter((s) => !s.active).slice(0, config.recentSessionsLimit);
+
+	const handleResizeStart = useCallback(
+		(e: React.MouseEvent) => {
+			e.preventDefault();
+			setIsResizing(true);
+			startXRef.current = e.clientX;
+			startWidthRef.current = width;
+		},
+		[width],
+	);
+
+	useEffect(() => {
+		if (!isResizing) return;
+
+		const handleMouseMove = (e: MouseEvent) => {
+			const delta = e.clientX - startXRef.current;
+			const newWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidthRef.current + delta));
+			onWidthChange(newWidth);
+		};
+
+		const handleMouseUp = () => {
+			setIsResizing(false);
+		};
+
+		document.addEventListener('mousemove', handleMouseMove);
+		document.addEventListener('mouseup', handleMouseUp);
+
+		return () => {
+			document.removeEventListener('mousemove', handleMouseMove);
+			document.removeEventListener('mouseup', handleMouseUp);
+		};
+	}, [isResizing, onWidthChange]);
 
 	return (
-		<aside className="sidebar">
+		<aside className="sidebar" style={{ width }}>
 			<div className="sidebar-header">
 				<h1 className="logo">
-					<span className="logo-icon">◉</span>
+					<span className="logo-icon">&#x25C9;</span>
 					Orbit
 				</h1>
-				<button type="button" className="refresh-btn" onClick={onRefresh} title="Refresh sessions">
-					↻
-				</button>
+				<div className="header-actions">
+					<button
+						type="button"
+						className="refresh-btn"
+						onClick={onRefresh}
+						title="Refresh sessions"
+					>
+						&#x21BB;
+					</button>
+				</div>
 			</div>
 
 			{activeSessions.length > 0 && (
 				<section className="session-group">
 					<h2 className="group-title">
-						<span className="active-indicator">⚡</span>
+						<span className="active-indicator">&#x26A1;</span>
 						Active
 					</h2>
 					<ul className="session-list">
@@ -36,7 +97,9 @@ export function Sidebar({ sessions, selectedSession, onSelectSession, onRefresh 
 							<SessionItem
 								key={session.id}
 								session={session}
+								title={sessionTitles[session.id] ?? null}
 								isSelected={selectedSession?.id === session.id}
+								isMruPreview={mruCycleSession?.id === session.id}
 								onSelect={onSelectSession}
 							/>
 						))}
@@ -51,7 +114,9 @@ export function Sidebar({ sessions, selectedSession, onSelectSession, onRefresh 
 						<SessionItem
 							key={session.id}
 							session={session}
+							title={sessionTitles[session.id] ?? null}
 							isSelected={selectedSession?.id === session.id}
+							isMruPreview={mruCycleSession?.id === session.id}
 							onSelect={onSelectSession}
 						/>
 					))}
@@ -63,20 +128,28 @@ export function Sidebar({ sessions, selectedSession, onSelectSession, onRefresh 
 					<p>No sessions found</p>
 				</div>
 			)}
+
+			<div
+				className={`resize-handle ${isResizing ? 'active' : ''}`}
+				onMouseDown={handleResizeStart}
+			/>
 		</aside>
 	);
 }
 
 interface SessionItemProps {
-	session: SessionInfo;
+	session: Session;
+	title: string | null;
 	isSelected: boolean;
-	onSelect: (session: SessionInfo) => void;
+	isMruPreview: boolean;
+	onSelect: (session: Session) => void;
 }
 
-function SessionItem({ session, isSelected, onSelect }: SessionItemProps) {
+function SessionItem({ session, title, isSelected, isMruPreview, onSelect }: SessionItemProps) {
 	const timeAgo = formatTimeAgo(session.mtime);
-	const typeIcon = session.type === 'agent' ? '🤖' : '💬';
+	const typeIcon = session.type === 'agent' ? '\uD83E\uDD16' : '\uD83D\uDCAC';
 	const shortId = session.id.slice(0, 8);
+	const displayName = title ?? shortId;
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === 'Enter' || e.key === ' ') {
@@ -85,14 +158,24 @@ function SessionItem({ session, isSelected, onSelect }: SessionItemProps) {
 		}
 	};
 
+	const classNames = [
+		'session-item',
+		isSelected ? 'selected' : '',
+		session.active ? 'active' : '',
+		isMruPreview ? 'mru-preview' : '',
+	]
+		.filter(Boolean)
+		.join(' ');
+
 	return (
 		<li
-			className={`session-item ${isSelected ? 'selected' : ''} ${session.active ? 'active' : ''}`}
+			className={classNames}
 			onClick={() => onSelect(session)}
 			onKeyDown={handleKeyDown}
+			title={title ? `${title} (${session.id})` : session.id}
 		>
 			<span className="session-type">{typeIcon}</span>
-			<span className="session-id">{shortId}</span>
+			<span className="session-id">{displayName}</span>
 			<span className="session-time">{timeAgo}</span>
 		</li>
 	);

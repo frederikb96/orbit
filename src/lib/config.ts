@@ -4,24 +4,44 @@
  * Loads config from XDG-compliant location:
  * - $XDG_CONFIG_HOME/orbit/config.json
  * - Fallback: ~/.config/orbit/config.json
+ *
+ * All defaults centralized here - single source of truth.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { OrbitConfig, UIConfig } from '../types/index.ts';
-
-const DEFAULT_UI_CONFIG: UIConfig = {
-	defaultExpandThinking: false,
-	defaultExpandToolCalls: false,
-	maxEntriesInMemory: 0, // 0 = unlimited
-	maxSessions: 10, // Show last 10 sessions by mtime
-	sessionPollInterval: 5_000, // Poll every 5s (0 = disabled)
-};
+import { DEFAULT_UI_CONFIG } from '../shared/defaults.ts';
+import type { OrbitConfig } from '../types.ts';
 
 const DEFAULT_CONFIG: OrbitConfig = {
+	sessions: {
+		count: 10,
+		refreshIntervalMs: 5000,
+		watchPath: join(homedir(), '.claude', 'projects'),
+		activeThresholdMs: 60_000,
+	},
+	transcript: {
+		initialLines: 0, // 0 = load all entries
+	},
 	ui: DEFAULT_UI_CONFIG,
+	server: {
+		port: 3000,
+	},
 };
+
+/**
+ * Deep merge user config with defaults.
+ * User values override defaults at any nesting level.
+ */
+function mergeConfig(defaults: OrbitConfig, user: Partial<OrbitConfig>): OrbitConfig {
+	return {
+		sessions: { ...defaults.sessions, ...(user.sessions || {}) },
+		transcript: { ...defaults.transcript, ...(user.transcript || {}) },
+		ui: { ...defaults.ui, ...(user.ui || {}) },
+		server: { ...defaults.server, ...(user.server || {}) },
+	};
+}
 
 function getConfigPath(): string {
 	const xdgConfig = process.env.XDG_CONFIG_HOME;
@@ -50,33 +70,27 @@ export function getConfig(): OrbitConfig {
 	try {
 		const content = readFileSync(configPath, 'utf-8');
 		const userConfig = JSON.parse(content) as Partial<OrbitConfig>;
-
-		// Deep merge with defaults
-		cachedConfig = {
-			ui: {
-				...DEFAULT_UI_CONFIG,
-				...(userConfig.ui || {}),
-			},
-		};
-
+		cachedConfig = mergeConfig(DEFAULT_CONFIG, userConfig);
 		return cachedConfig;
-	} catch {
-		// Config parse error - use defaults
+	} catch (err) {
+		console.error(`Failed to parse config at ${configPath}, using defaults:`, err);
 		cachedConfig = DEFAULT_CONFIG;
 		return cachedConfig;
 	}
 }
 
 /**
- * Get the config path for documentation purposes.
+ * Get a fresh config (bypasses cache).
+ * Use sparingly - prefer getConfig() for performance.
  */
-export function getConfigFilePath(): string {
-	return getConfigPath();
+export function reloadConfig(): OrbitConfig {
+	cachedConfig = null;
+	return getConfig();
 }
 
 /**
- * Reset cached config (useful for testing).
+ * Get the config file path (for diagnostics).
  */
-export function resetConfigCache(): void {
-	cachedConfig = null;
+export function getConfigFilePath(): string {
+	return getConfigPath();
 }

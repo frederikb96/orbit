@@ -3,18 +3,16 @@ import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
 	StreamingParser,
-	formatNumber,
-	formatTime,
-	formatToolInput,
 	parseEntry,
 	parseTranscript,
 	parseTranscriptTail,
 	updateTokens,
 } from '../src/lib/transcript.ts';
-import type { TokenStats } from '../src/types/index.ts';
+import { formatNumber, formatTime, formatToolInput } from '../src/shared/formatters.ts';
+import type { TokenStats } from '../src/types.ts';
 
-// Test file for tail loading tests
-const TEST_FILE = join(import.meta.dir, 'test-transcript.jsonl');
+const TEST_DIR = join(import.meta.dir, 'fixtures');
+const TEST_FILE = join(TEST_DIR, 'test-transcript.jsonl');
 
 describe('parseEntry', () => {
 	const toolMap = new Map<string, string>();
@@ -79,7 +77,6 @@ describe('parseEntry', () => {
 	});
 
 	test('parses tool result entry', () => {
-		// First add tool to map
 		toolMap.set('tool-1', 'Read');
 
 		const line = JSON.stringify({
@@ -113,22 +110,6 @@ describe('parseEntry', () => {
 		const entry = parseEntry(line, toolMap);
 		expect(entry?.thinking).toBe('Let me think...');
 		expect(entry?.content).toBe('Here is my response');
-	});
-
-	test('parses system hook summary', () => {
-		const line = JSON.stringify({
-			type: 'system',
-			subtype: 'stop_hook_summary',
-			timestamp: '2024-01-15T10:30:03Z',
-			hookInfos: [{ command: '/path/to/hook.ts' }],
-			hookErrors: ['Error message'],
-			preventedContinuation: false,
-		});
-
-		const entry = parseEntry(line, toolMap);
-		expect(entry?.type).toBe('system');
-		expect(entry?.hookSummary?.hookNames).toContain('hook.ts');
-		expect(entry?.hookSummary?.hasErrors).toBe(true);
 	});
 });
 
@@ -210,7 +191,6 @@ describe('formatNumber', () => {
 describe('formatTime', () => {
 	test('formats ISO timestamp', () => {
 		const result = formatTime('2024-01-15T10:30:45Z');
-		// Result depends on locale, just check it's not empty
 		expect(result).toBeTruthy();
 		expect(result).toMatch(/\d{2}:\d{2}:\d{2}/);
 	});
@@ -271,11 +251,9 @@ describe('StreamingParser', () => {
 	test('buffers incomplete lines', () => {
 		const parser = new StreamingParser();
 
-		// First chunk - incomplete
 		const entries1 = parser.parse('{"type":"user"');
 		expect(entries1).toHaveLength(0);
 
-		// Second chunk - completes the line
 		const entries2 = parser.parse(',"userType":"external","message":{"content":"Hi"}}\n');
 		expect(entries2).toHaveLength(1);
 	});
@@ -293,8 +271,11 @@ describe('StreamingParser', () => {
 });
 
 describe('parseTranscriptTail', () => {
-	// Create test file with many entries
 	beforeAll(() => {
+		if (!existsSync(TEST_DIR)) {
+			require('node:fs').mkdirSync(TEST_DIR, { recursive: true });
+		}
+
 		const lines: string[] = [];
 		for (let i = 0; i < 200; i++) {
 			lines.push(
@@ -312,6 +293,9 @@ describe('parseTranscriptTail', () => {
 		if (existsSync(TEST_FILE)) {
 			rmSync(TEST_FILE);
 		}
+		if (existsSync(TEST_DIR)) {
+			rmSync(TEST_DIR, { recursive: true });
+		}
 	});
 
 	test('loads tail entries with limit', async () => {
@@ -321,8 +305,7 @@ describe('parseTranscriptTail', () => {
 	});
 
 	test('loads all entries when file is small', async () => {
-		// Create small test file
-		const smallFile = join(import.meta.dir, 'small-test.jsonl');
+		const smallFile = join(TEST_DIR, 'small-test.jsonl');
 		const lines = [
 			JSON.stringify({ type: 'user', userType: 'external', message: { content: 'One' } }),
 			JSON.stringify({ type: 'user', userType: 'external', message: { content: 'Two' } }),
@@ -339,7 +322,7 @@ describe('parseTranscriptTail', () => {
 	});
 
 	test('returns empty for empty file', async () => {
-		const emptyFile = join(import.meta.dir, 'empty-test.jsonl');
+		const emptyFile = join(TEST_DIR, 'empty-test.jsonl');
 		writeFileSync(emptyFile, '');
 
 		try {
@@ -352,12 +335,10 @@ describe('parseTranscriptTail', () => {
 	});
 
 	test('pagination with beforeByte', async () => {
-		// First load - get cursor
 		const first = await parseTranscriptTail(TEST_FILE, 50);
 		expect(first.entries.length).toBeGreaterThan(0);
 		expect(first.hasMore).toBe(true);
 
-		// Second load - use cursor to load older entries
 		if (first.cursor > 0) {
 			const second = await parseTranscriptTail(TEST_FILE, 50, first.cursor);
 			expect(second.entries.length).toBeGreaterThan(0);
