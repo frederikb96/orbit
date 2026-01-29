@@ -16,7 +16,8 @@ import { type FSWatcher, watch } from 'node:fs';
  */
 export function createWatcher(path: string, onFileChange: (filePath: string) => void): FSWatcher {
 	const watcher = watch(path, { recursive: true }, (event, filename) => {
-		if (event === 'change' && filename) {
+		// Handle both 'change' (content modified) and 'rename' (created/deleted)
+		if ((event === 'change' || event === 'rename') && filename) {
 			// Construct full path from base path and relative filename
 			const fullPath = `${path}/${filename}`;
 			onFileChange(fullPath);

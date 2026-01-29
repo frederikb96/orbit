@@ -45,7 +45,6 @@ export interface Session {
 	type: SessionType;
 	lastSeen: number; // mtime in ms
 	mtime: number; // alias for lastSeen (client compatibility)
-	size: number; // file size in bytes
 	active: boolean; // true if modified within activeThresholdMs
 }
 
@@ -141,7 +140,7 @@ export interface PaginatedEntries {
 }
 
 // SSE event types
-export type SSEEventType = 'init' | 'batch' | 'truncated' | 'ping';
+export type SSEEventType = 'init' | 'batch' | 'truncated' | 'ping' | 'sessions';
 
 export interface SSEEvent {
 	type: SSEEventType;

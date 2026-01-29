@@ -39,35 +39,21 @@ export function App() {
 	// Session titles fetched via bash command
 	const [sessionTitles, setSessionTitles] = useState<Record<string, string | null>>({});
 
-	// Fetch session titles periodically if command is configured
-	useEffect(() => {
-		const command = config.sessionTitleCommand;
-		const intervalMs = config.sessionTitleIntervalMs || 15000;
-
-		if (!command || sessions.length === 0) return;
-
-		const fetchTitles = async () => {
-			try {
-				const sessionIds = sessions.map((s) => s.id);
-				const res = await fetch('/api/session-titles', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ sessionIds }),
-				});
-				if (res.ok) {
-					const data = (await res.json()) as { titles: Record<string, string | null> };
-					setSessionTitles(data.titles);
-				}
-			} catch {
-				// Ignore fetch errors
-			}
-		};
-
-		// Fetch immediately and then periodically
-		fetchTitles();
-		const interval = setInterval(fetchTitles, intervalMs);
-		return () => clearInterval(interval);
-	}, [sessions, config.sessionTitleCommand, config.sessionTitleIntervalMs]);
+	// Session title fetching disabled - causes high CPU due to slow csm calls
+	// TODO: Re-enable with on-demand fetching instead of polling
+	// useEffect(() => {
+	// 	const command = config.sessionTitleCommand;
+	// 	const intervalMs = config.sessionTitleIntervalMs || 15000;
+	// 	if (!command || sessions.length === 0) return;
+	// 	const fetchTitles = async () => {
+	// 		const sessionIds = sessions.map((s) => s.id);
+	// 		const res = await fetch('/api/session-titles', { method: 'POST', ... });
+	// 		...
+	// 	};
+	// 	fetchTitles();
+	// 	const interval = setInterval(fetchTitles, intervalMs);
+	// 	return () => clearInterval(interval);
+	// }, [sessions, config.sessionTitleCommand, config.sessionTitleIntervalMs]);
 
 	// SSE reconnect settings from config
 	const sseMaxRetries = config.sseMaxRetries;
@@ -77,28 +63,69 @@ export function App() {
 	// Ref to track current session ID (prevents cross-contamination during session switches)
 	const currentSessionIdRef = useRef<string | null>(null);
 
-	// Fetch sessions list
-	const fetchSessions = useCallback(async () => {
-		try {
-			const res = await fetch('/api/sessions');
-			if (!res.ok) throw new Error('Failed to fetch sessions');
-			const data = await res.json();
-			setSessions(data);
-			setLoading(false);
-		} catch (err) {
-			setError(err instanceof Error ? err.message : 'Unknown error');
-			setLoading(false);
-		}
-	}, []);
-
-	// Initial fetch and periodic refresh
+	// SSE connection for session list (push-based, no polling)
 	useEffect(() => {
-		fetchSessions();
-		if (config.sessionPollIntervalMs > 0) {
-			const interval = setInterval(fetchSessions, config.sessionPollIntervalMs);
-			return () => clearInterval(interval);
-		}
-	}, [fetchSessions, config.sessionPollIntervalMs]);
+		let eventSource: EventSource | null = null;
+		let retryCount = 0;
+		let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+
+		const connect = () => {
+			eventSource = new EventSource('/api/sessions/stream');
+
+			eventSource.onmessage = (event) => {
+				try {
+					const data = JSON.parse(event.data);
+					if (data.type === 'sessions' && Array.isArray(data.sessions)) {
+						// Only update if sessions actually changed (avoids re-renders from timestamp updates)
+						setSessions((prev) => {
+							if (prev.length !== data.sessions.length) return data.sessions;
+							// Compare by ID and order - ignore mtime/lastSeen changes
+							const changed = prev.some(
+								(s, i) => s.id !== data.sessions[i]?.id || s.active !== data.sessions[i]?.active,
+							);
+							return changed ? data.sessions : prev;
+						});
+						setLoading(false);
+						setError(null);
+						retryCount = 0;
+					}
+				} catch {
+					// Parse error
+				}
+			};
+
+			eventSource.onerror = () => {
+				eventSource?.close();
+				retryCount++;
+
+				if (retryCount > sseMaxRetries) {
+					setError('Connection to server lost');
+					setLoading(false);
+					return;
+				}
+
+				const delay = Math.min(sseBaseDelayMs * 2 ** (retryCount - 1), sseMaxDelayMs);
+				retryTimeout = setTimeout(connect, delay);
+			};
+		};
+
+		connect();
+
+		return () => {
+			eventSource?.close();
+			if (retryTimeout) {
+				clearTimeout(retryTimeout);
+			}
+		};
+	}, [sseMaxRetries, sseBaseDelayMs, sseMaxDelayMs]);
+
+	// Manual refresh (for retry button)
+	const handleRefresh = useCallback(() => {
+		setLoading(true);
+		setError(null);
+		// Force reconnect by triggering the useEffect
+		window.location.reload();
+	}, []);
 
 	// SSE connection error state
 	const [sseError, setSseError] = useState<string | null>(null);
@@ -123,6 +150,7 @@ export function App() {
 		let eventSource: EventSource | null = null;
 		let retryCount = 0;
 		let isFirstInit = true;
+		let retryTimeout: ReturnType<typeof setTimeout> | null = null;
 
 		const connect = () => {
 			eventSource = new EventSource(`/api/sessions/${selectedSession.id}/stream`);
@@ -185,7 +213,7 @@ export function App() {
 				}
 
 				const delay = Math.min(sseBaseDelayMs * 2 ** (retryCount - 1), sseMaxDelayMs);
-				setTimeout(connect, delay);
+				retryTimeout = setTimeout(connect, delay);
 			};
 		};
 
@@ -193,6 +221,9 @@ export function App() {
 
 		return () => {
 			eventSource?.close();
+			if (retryTimeout) {
+				clearTimeout(retryTimeout);
+			}
 		};
 	}, [selectedSession, reloadTrigger, sseMaxRetries, sseBaseDelayMs, sseMaxDelayMs]);
 
@@ -248,6 +279,30 @@ export function App() {
 		mruModifiersHeldRef.current = false;
 	}, [mruCycleIndex, mruStack, sessions, handleSelectSession]);
 
+	// Navigate to adjacent session in list
+	const handleNavigateSession = useCallback(
+		(direction: -1 | 1) => {
+			if (sortedSessions.length === 0) return;
+
+			const currentIndex = selectedSession
+				? sortedSessions.findIndex((s) => s.id === selectedSession.id)
+				: -1;
+
+			let newIndex: number;
+			if (currentIndex === -1) {
+				// No session selected: go to first (down) or last (up)
+				newIndex = direction === 1 ? 0 : sortedSessions.length - 1;
+			} else {
+				newIndex = currentIndex + direction;
+				// Clamp to valid range
+				if (newIndex < 0 || newIndex >= sortedSessions.length) return;
+			}
+
+			handleSelectSession(sortedSessions[newIndex]);
+		},
+		[sortedSessions, selectedSession, handleSelectSession],
+	);
+
 	// Global keyboard shortcuts
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -283,6 +338,16 @@ export function App() {
 					e.preventDefault();
 					handleToggleExpandToolCalls();
 					break;
+				case 'pageup':
+				case ',':
+					e.preventDefault();
+					handleNavigateSession(-1);
+					break;
+				case 'pagedown':
+				case '.':
+					e.preventDefault();
+					handleNavigateSession(1);
+					break;
 			}
 		};
 
@@ -299,7 +364,13 @@ export function App() {
 			window.removeEventListener('keydown', handleKeyDown);
 			window.removeEventListener('keyup', handleKeyUp);
 		};
-	}, [handleToggleExpandThinking, handleToggleExpandToolCalls, mruStack, commitMruSelection]);
+	}, [
+		handleToggleExpandThinking,
+		handleToggleExpandToolCalls,
+		mruStack,
+		commitMruSelection,
+		handleNavigateSession,
+	]);
 
 	if (loading) {
 		return (
@@ -315,7 +386,7 @@ export function App() {
 			<div className="app error">
 				<h1>Error</h1>
 				<p>{error}</p>
-				<button type="button" onClick={fetchSessions}>
+				<button type="button" onClick={handleRefresh}>
 					Retry
 				</button>
 			</div>
@@ -328,7 +399,7 @@ export function App() {
 				sessions={sortedSessions}
 				selectedSession={selectedSession}
 				onSelectSession={handleSelectSession}
-				onRefresh={fetchSessions}
+				onRefresh={handleRefresh}
 				width={sidebarWidth}
 				onWidthChange={setSidebarWidth}
 				sessionTitles={sessionTitles}

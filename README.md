@@ -51,6 +51,8 @@ Open http://localhost:3000 in your browser.
 All shortcuts use **Shift+Alt** modifier:
 
 - **Q** - MRU session switcher (hold modifiers, press Q to cycle, release to confirm)
+- **PageUp** or **,** - Previous session (up in list)
+- **PageDown** or **.** - Next session (down in list)
 - **T** - Toggle thinking block expansion
 - **O** - Toggle tool call expansion
 - **S** - Enable autoscroll and jump to bottom

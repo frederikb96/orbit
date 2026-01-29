@@ -8,18 +8,10 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { getConfig } from '../lib/config.ts';
-import { getSessionManager } from '../lib/sessions.ts';
+import { getSessionManager, isValidSessionId } from '../lib/sessions.ts';
 import { parseTranscriptTail } from '../lib/transcript.ts';
-import type { OrbitConfig } from '../types.ts';
+import type { OrbitConfig, Session } from '../types.ts';
 import { createSSEHandler } from './sse.ts';
-
-// Session ID validation patterns (same as sessions.ts)
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const AGENT_ID_REGEX = /^[a-f0-9]{7}$/;
-
-function isValidSessionId(id: string): boolean {
-	return UUID_REGEX.test(id) || AGENT_ID_REGEX.test(id);
-}
 
 const MIME_TYPES: Record<string, string> = {
 	'.html': 'text/html',
@@ -31,12 +23,23 @@ const MIME_TYPES: Record<string, string> = {
 	'.ico': 'image/x-icon',
 };
 
+// Session list SSE client
+interface SessionListClient {
+	controller: ReadableStreamDefaultController;
+	pingInterval: ReturnType<typeof setInterval>;
+}
+
+const KEEP_ALIVE_INTERVAL_MS = 30_000;
+
 export class OrbitServer {
 	private config: OrbitConfig;
 	private publicDir: string;
 	private server: ReturnType<typeof Bun.serve> | null = null;
 	private sessionManager = getSessionManager();
 	private sseHandler = createSSEHandler();
+	private sessionListClients: Map<string, SessionListClient> = new Map();
+	private sessionListClientCounter = 0;
+	private unsubscribeSessionChanges: (() => void) | null = null;
 
 	constructor(config?: OrbitConfig) {
 		this.config = config ?? getConfig();
@@ -50,6 +53,11 @@ export class OrbitServer {
 		// Initialize session manager
 		this.sessionManager.initialize();
 		this.sessionManager.startWatcher();
+
+		// Subscribe to session changes for SSE broadcast
+		this.unsubscribeSessionChanges = this.sessionManager.onChange((sessions) => {
+			this.broadcastSessionList(sessions);
+		});
 
 		// Support ORBIT_PORT env var for CLI
 		const port = process.env.ORBIT_PORT
@@ -85,6 +93,23 @@ export class OrbitServer {
 	 * Stop the server.
 	 */
 	stop(): void {
+		// Close session list SSE clients
+		for (const [clientId, client] of this.sessionListClients) {
+			clearInterval(client.pingInterval);
+			try {
+				client.controller.close();
+			} catch {
+				// Already closed
+			}
+		}
+		this.sessionListClients.clear();
+
+		// Unsubscribe from session changes
+		if (this.unsubscribeSessionChanges) {
+			this.unsubscribeSessionChanges();
+			this.unsubscribeSessionChanges = null;
+		}
+
 		this.sseHandler.closeAll();
 		this.sessionManager.stopWatcher();
 		this.server?.stop();
@@ -110,6 +135,11 @@ export class OrbitServer {
 			const sessions = this.sessionManager.getSessions();
 			const clientSessions = sessions.map(({ path: _path, ...rest }) => rest);
 			return Response.json(clientSessions);
+		}
+
+		// GET /api/sessions/stream - SSE stream for session list updates
+		if (path === '/api/sessions/stream' && req.method === 'GET') {
+			return this.createSessionListStream();
 		}
 
 		// GET /api/sessions/:id - Get session info (excludes internal path field)
@@ -224,6 +254,73 @@ export class OrbitServer {
 		return new Response(content, {
 			headers: { 'Content-Type': contentType },
 		});
+	}
+
+	/**
+	 * Create SSE stream for session list updates.
+	 */
+	private createSessionListStream(): Response {
+		const clientId = `session-list-${++this.sessionListClientCounter}`;
+		const encoder = new TextEncoder();
+
+		const stream = new ReadableStream({
+			start: (controller) => {
+				// Send initial session list
+				const sessions = this.sessionManager.getSessions();
+				const clientSessions = sessions.map(({ path: _path, ...rest }) => rest);
+				const initData = `data: ${JSON.stringify({ type: 'sessions', sessions: clientSessions })}\n\n`;
+				controller.enqueue(encoder.encode(initData));
+
+				// Keep-alive ping
+				const pingInterval = setInterval(() => {
+					try {
+						controller.enqueue(encoder.encode(': ping\n\n'));
+					} catch {
+						// Client disconnected - cleanup
+						clearInterval(pingInterval);
+						this.sessionListClients.delete(clientId);
+					}
+				}, KEEP_ALIVE_INTERVAL_MS);
+
+				// Store client
+				this.sessionListClients.set(clientId, { controller, pingInterval });
+			},
+			cancel: () => {
+				const client = this.sessionListClients.get(clientId);
+				if (client) {
+					clearInterval(client.pingInterval);
+					this.sessionListClients.delete(clientId);
+				}
+			},
+		});
+
+		return new Response(stream, {
+			headers: {
+				'Content-Type': 'text/event-stream',
+				'Cache-Control': 'no-cache',
+				Connection: 'keep-alive',
+			},
+		});
+	}
+
+	/**
+	 * Broadcast session list to all connected SSE clients.
+	 */
+	private broadcastSessionList(sessions: Session[]): void {
+		const clientSessions = sessions.map(({ path: _path, ...rest }) => rest);
+		const data = `data: ${JSON.stringify({ type: 'sessions', sessions: clientSessions })}\n\n`;
+		const encoder = new TextEncoder();
+		const encoded = encoder.encode(data);
+
+		for (const [clientId, client] of this.sessionListClients) {
+			try {
+				client.controller.enqueue(encoded);
+			} catch {
+				// Client disconnected, clean up
+				clearInterval(client.pingInterval);
+				this.sessionListClients.delete(clientId);
+			}
+		}
 	}
 
 	/**

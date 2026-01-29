@@ -17,6 +17,8 @@ export interface GetNewestFilesOptions {
 	followSymlinks?: boolean;
 	/** File extension filter, e.g. ".jsonl" (default: all files) */
 	extension?: string;
+	/** Optional filename predicate - only stat files where this returns true */
+	matchFilename?: (filename: string) => boolean;
 }
 
 /**
@@ -44,7 +46,7 @@ export function getNewestNFiles(
 	if (n <= 0) return [];
 	if (!existsSync(dirPath)) return [];
 
-	const { followSymlinks = false, extension } = options;
+	const { followSymlinks = false, extension, matchFilename } = options;
 	const files: FileWithMtime[] = [];
 
 	try {
@@ -62,10 +64,11 @@ export function getNewestNFiles(
 
 			if (entry.isSymbolicLink()) {
 				if (!followSymlinks) continue;
+				if (extension && !entry.name.endsWith(extension)) continue;
+				if (matchFilename && !matchFilename(entry.name)) continue;
 				try {
 					const stat = statSync(fullPath);
 					if (!stat.isFile()) continue;
-					if (extension && !fullPath.endsWith(extension)) continue;
 					files.push({ path: fullPath, mtimeMs: stat.mtimeMs });
 				} catch {
 					// Target doesn't exist or permission denied
@@ -75,6 +78,7 @@ export function getNewestNFiles(
 
 			if (!entry.isFile()) continue;
 			if (extension && !entry.name.endsWith(extension)) continue;
+			if (matchFilename && !matchFilename(entry.name)) continue;
 
 			try {
 				const stat = lstatSync(fullPath);
