@@ -159,10 +159,12 @@ export class SSEHandler {
 					}
 				}, KEEP_ALIVE_INTERVAL_MS);
 
-				// Update client with ping interval
+				// Update client with ping interval (handle race with early disconnect)
 				const client = this.clients.get(clientId);
 				if (client) {
 					client.pingInterval = pingInterval;
+				} else {
+					clearInterval(pingInterval);
 				}
 			},
 			cancel: () => {

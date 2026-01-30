@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Session } from '../../types.ts';
 import { useConfig } from '../ConfigContext.tsx';
+import { useTheme } from '../hooks/useTheme.ts';
 
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 500;
@@ -27,13 +28,20 @@ export function Sidebar({
 	mruCycleSession,
 }: SidebarProps) {
 	const { config } = useConfig();
+	const { theme, cycleTheme, isDark } = useTheme();
 	const [isResizing, setIsResizing] = useState(false);
 	const startXRef = useRef(0);
 	const startWidthRef = useRef(0);
 
+	// Compute active status client-side from mtime + threshold (live updates)
+	const isSessionActive = (session: Session) =>
+		Date.now() - session.mtime < config.activeThresholdMs;
+
 	// Group sessions by active/recent
-	const activeSessions = sessions.filter((s) => s.active);
-	const recentSessions = sessions.filter((s) => !s.active).slice(0, config.recentSessionsLimit);
+	const activeSessions = sessions.filter(isSessionActive);
+	const recentSessions = sessions
+		.filter((s) => !isSessionActive(s))
+		.slice(0, config.recentSessionsLimit);
 
 	const handleResizeStart = useCallback(
 		(e: React.MouseEvent) => {
@@ -77,6 +85,14 @@ export function Sidebar({
 				<div className="header-actions">
 					<button
 						type="button"
+						className="theme-toggle"
+						onClick={cycleTheme}
+						title={`Theme: ${theme} (click to cycle)`}
+					>
+						{isDark ? '🌙' : theme === 'system' ? '💻' : '☀️'}
+					</button>
+					<button
+						type="button"
 						className="refresh-btn"
 						onClick={onRefresh}
 						title="Refresh sessions"
@@ -99,6 +115,7 @@ export function Sidebar({
 								session={session}
 								title={sessionTitles[session.id] ?? null}
 								isSelected={selectedSession?.id === session.id}
+								isActive={true}
 								isMruPreview={mruCycleSession?.id === session.id}
 								onSelect={onSelectSession}
 							/>
@@ -116,6 +133,7 @@ export function Sidebar({
 							session={session}
 							title={sessionTitles[session.id] ?? null}
 							isSelected={selectedSession?.id === session.id}
+							isActive={false}
 							isMruPreview={mruCycleSession?.id === session.id}
 							onSelect={onSelectSession}
 						/>
@@ -141,15 +159,24 @@ interface SessionItemProps {
 	session: Session;
 	title: string | null;
 	isSelected: boolean;
+	isActive: boolean;
 	isMruPreview: boolean;
 	onSelect: (session: Session) => void;
 }
 
-function SessionItem({ session, title, isSelected, isMruPreview, onSelect }: SessionItemProps) {
+function SessionItem({
+	session,
+	title,
+	isSelected,
+	isActive,
+	isMruPreview,
+	onSelect,
+}: SessionItemProps) {
 	const timeAgo = formatTimeAgo(session.mtime);
 	const typeIcon = session.type === 'agent' ? '\uD83E\uDD16' : '\uD83D\uDCAC';
 	const shortId = session.id.slice(0, 8);
-	const displayName = title ?? shortId;
+	// Prefer server-set name, then legacy title prop, then shortId
+	const displayName = session.name ?? title ?? shortId;
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === 'Enter' || e.key === ' ') {
@@ -161,7 +188,7 @@ function SessionItem({ session, title, isSelected, isMruPreview, onSelect }: Ses
 	const classNames = [
 		'session-item',
 		isSelected ? 'selected' : '',
-		session.active ? 'active' : '',
+		isActive ? 'active' : '',
 		isMruPreview ? 'mru-preview' : '',
 	]
 		.filter(Boolean)

@@ -1,4 +1,39 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+/**
+ * Batches rapid state updates into single updates at most every `delay` ms.
+ * Accumulates new entries between flushes to prevent rapid re-renders from SSE bursts.
+ */
+function useBatchedAppend<T>(
+	setState: React.Dispatch<React.SetStateAction<{ entries: T[]; numPrepended: number }>>,
+	delay: number,
+): (items: T[]) => void {
+	const pendingRef = useRef<T[]>([]);
+	const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+	return useCallback(
+		(items: T[]) => {
+			pendingRef.current = [...pendingRef.current, ...items];
+
+			if (!timeoutRef.current) {
+				timeoutRef.current = setTimeout(() => {
+					const batch = pendingRef.current;
+					pendingRef.current = [];
+					timeoutRef.current = null;
+
+					if (batch.length > 0) {
+						// Append new entries (numPrepended unchanged - only used for prepending)
+						setState((prev) => ({
+							...prev,
+							entries: [...prev.entries, ...batch],
+						}));
+					}
+				}, delay);
+			}
+		},
+		[setState, delay],
+	);
+}
 import type { ParsedEntry, Session, TokenStats } from '../types.ts';
 import { useConfig } from './ConfigContext.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
@@ -8,15 +43,31 @@ export function App() {
 	const { config } = useConfig();
 	const [sessions, setSessions] = useState<Session[]>([]);
 	const [selectedSession, setSelectedSession] = useState<Session | null>(null);
-	const [entries, setEntries] = useState<ParsedEntry[]>([]);
+	// Combined state for entries + numPrepended to ensure atomic updates
+	// This prevents scroll jumps when prepending older entries (Virtuoso requires
+	// firstItemIndex and data to update in the exact same render)
+	const [entryState, setEntryState] = useState<{
+		entries: ParsedEntry[];
+		numPrepended: number;
+	}>({ entries: [], numPrepended: 0 });
+	const entries = entryState.entries;
+	const numPrepended = entryState.numPrepended;
+
 	const [tokens, setTokens] = useState<TokenStats | null>(null);
 	const [loading, setLoading] = useState(true);
 	const [transcriptLoading, setTranscriptLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 
-	// Expand state for thinking/tool blocks
+	// Windowed loading state
+	const [cursor, setCursor] = useState<number | null>(null);
+	const [hasMore, setHasMore] = useState(false);
+	const [isLoadingOlder, setIsLoadingOlder] = useState(false);
+
+	// Expand state for thinking/tool blocks (null = use config default)
 	const [expandThinking, setExpandThinking] = useState<boolean | null>(null);
-	const [expandToolCalls, setExpandToolCalls] = useState<boolean | null>(null);
+	const [expandRead, setExpandRead] = useState<boolean | null>(null);
+	const [expandEdit, setExpandEdit] = useState<boolean | null>(null);
+	const [expandOther, setExpandOther] = useState<boolean | null>(null);
 
 	// MRU (Most Recently Used) stack: ordered list of session IDs, index 0 = most recent
 	const [mruStack, setMruStack] = useState<string[]>([]);
@@ -63,6 +114,9 @@ export function App() {
 	// Ref to track current session ID (prevents cross-contamination during session switches)
 	const currentSessionIdRef = useRef<string | null>(null);
 
+	// Batched entry append to prevent rapid re-renders from SSE bursts
+	const batchedAppendEntries = useBatchedAppend(setEntryState, 100);
+
 	// SSE connection for session list (push-based, no polling)
 	useEffect(() => {
 		let eventSource: EventSource | null = null;
@@ -79,10 +133,8 @@ export function App() {
 						// Only update if sessions actually changed (avoids re-renders from timestamp updates)
 						setSessions((prev) => {
 							if (prev.length !== data.sessions.length) return data.sessions;
-							// Compare by ID and order - ignore mtime/lastSeen changes
-							const changed = prev.some(
-								(s, i) => s.id !== data.sessions[i]?.id || s.active !== data.sessions[i]?.active,
-							);
+							// Compare by ID and order only - active is computed client-side
+							const changed = prev.some((s, i) => s.id !== data.sessions[i]?.id);
 							return changed ? data.sessions : prev;
 						});
 						setLoading(false);
@@ -138,7 +190,7 @@ export function App() {
 	useEffect(() => {
 		if (!selectedSession) {
 			currentSessionIdRef.current = null;
-			setEntries([]);
+			setEntryState({ entries: [], numPrepended: 0 });
 			setTokens(null);
 			setSseError(null);
 			return;
@@ -169,9 +221,13 @@ export function App() {
 
 					if (data.type === 'init') {
 						if (isFirstInit || data.entries.length > 0) {
-							setEntries(data.entries);
+							// Atomic update: entries + numPrepended reset together
+							setEntryState({ entries: data.entries, numPrepended: 0 });
 							const stats = calculateTokens(data.entries);
 							setTokens(stats);
+							// Capture windowed loading state
+							setCursor(data.cursor ?? null);
+							setHasMore(data.hasMore ?? false);
 						}
 						isFirstInit = false;
 						setTranscriptLoading(false);
@@ -179,8 +235,10 @@ export function App() {
 						const newEntries = data.entries as ParsedEntry[];
 						if (newEntries.length === 0) return;
 
-						setEntries((prev) => [...prev, ...newEntries]);
+						// Batched append prevents rapid re-renders from SSE bursts
+						batchedAppendEntries(newEntries);
 
+						// Token updates are immediate since they're lightweight
 						setTokens((prev) => {
 							let stats = prev;
 							for (const entry of newEntries) {
@@ -194,7 +252,7 @@ export function App() {
 							return stats;
 						});
 					} else if (data.type === 'truncated') {
-						setEntries([]);
+						setEntryState({ entries: [], numPrepended: 0 });
 						setTokens(null);
 					}
 				} catch {
@@ -225,11 +283,18 @@ export function App() {
 				clearTimeout(retryTimeout);
 			}
 		};
-	}, [selectedSession, reloadTrigger, sseMaxRetries, sseBaseDelayMs, sseMaxDelayMs]);
+	}, [
+		selectedSession,
+		reloadTrigger,
+		sseMaxRetries,
+		sseBaseDelayMs,
+		sseMaxDelayMs,
+		batchedAppendEntries,
+	]);
 
 	const handleSelectSession = useCallback((session: Session) => {
 		setSelectedSession(session);
-		setEntries([]);
+		setEntryState({ entries: [], numPrepended: 0 });
 		setTokens(null);
 		setTranscriptLoading(true);
 
@@ -241,11 +306,66 @@ export function App() {
 	}, []);
 
 	const handleReload = useCallback(() => {
-		setEntries([]);
+		setEntryState({ entries: [], numPrepended: 0 });
 		setTokens(null);
 		setTranscriptLoading(true);
+		setCursor(null);
+		setHasMore(false);
 		setReloadTrigger((prev) => prev + 1);
 	}, []);
+
+	// Load older entries (windowed loading)
+	const loadOlderEntries = useCallback(async () => {
+		if (!hasMore || isLoadingOlder || !selectedSession || cursor === null) return;
+
+		setIsLoadingOlder(true);
+		try {
+			const response = await fetch(
+				`/api/sessions/${selectedSession.id}/entries?before=${cursor}&limit=15`,
+			);
+			if (!response.ok) throw new Error('Failed to load older entries');
+
+			const data = await response.json();
+			const olderEntries = data.entries as ParsedEntry[];
+
+			if (olderEntries.length > 0) {
+				// Count only entries that will appear in displayEntries (non-tool_result)
+				// Tool results are filtered out in TranscriptView, so numPrepended must match
+				// what Virtuoso actually displays, not the raw entry count
+				const displayCount = olderEntries.filter((e) => e.type !== 'tool_result').length;
+
+				// ATOMIC update: entries + numPrepended must change together
+				// This prevents scroll jumps - Virtuoso needs firstItemIndex and data
+				// to update in exactly the same render cycle
+				setEntryState((prev) => ({
+					entries: [...olderEntries, ...prev.entries],
+					numPrepended: prev.numPrepended + displayCount,
+				}));
+
+				// Update token stats for older entries
+				setTokens((prev) => {
+					let stats = prev;
+					for (const entry of olderEntries) {
+						if (entry.type === 'user') {
+							stats = { ...stats, turns: (stats?.turns || 0) + 1 } as typeof stats;
+						}
+						if (entry.tokens) {
+							stats = updateTokenStats(stats, entry.tokens);
+						}
+					}
+					return stats;
+				});
+			}
+
+			// Update pagination state
+			setCursor(data.cursor ?? null);
+			setHasMore(data.hasMore ?? false);
+		} catch (err) {
+			console.error('Failed to load older entries:', err);
+		} finally {
+			setIsLoadingOlder(false);
+		}
+	}, [hasMore, isLoadingOlder, selectedSession, cursor]);
 
 	// Sessions are already sorted by modification time from server (newest first)
 	const sortedSessions = sessions;
@@ -262,9 +382,17 @@ export function App() {
 		setExpandThinking((prev) => (prev === null ? !config.defaultExpandThinking : !prev));
 	}, [config.defaultExpandThinking]);
 
-	const handleToggleExpandToolCalls = useCallback(() => {
-		setExpandToolCalls((prev) => (prev === null ? !config.defaultExpandToolCalls : !prev));
-	}, [config.defaultExpandToolCalls]);
+	const handleToggleExpandRead = useCallback(() => {
+		setExpandRead((prev) => (prev === null ? !config.defaultExpandRead : !prev));
+	}, [config.defaultExpandRead]);
+
+	const handleToggleExpandEdit = useCallback(() => {
+		setExpandEdit((prev) => (prev === null ? !config.defaultExpandEdit : !prev));
+	}, [config.defaultExpandEdit]);
+
+	const handleToggleExpandOther = useCallback(() => {
+		setExpandOther((prev) => (prev === null ? !config.defaultExpandOther : !prev));
+	}, [config.defaultExpandOther]);
 
 	// MRU cycling: commit selection when modifiers released
 	const commitMruSelection = useCallback(() => {
@@ -334,9 +462,13 @@ export function App() {
 					e.preventDefault();
 					handleToggleExpandThinking();
 					break;
+				case 'e':
+					e.preventDefault();
+					handleToggleExpandEdit();
+					break;
 				case 'o':
 					e.preventDefault();
-					handleToggleExpandToolCalls();
+					handleToggleExpandOther();
 					break;
 				case 'pageup':
 				case ',':
@@ -366,7 +498,8 @@ export function App() {
 		};
 	}, [
 		handleToggleExpandThinking,
-		handleToggleExpandToolCalls,
+		handleToggleExpandEdit,
+		handleToggleExpandOther,
 		mruStack,
 		commitMruSelection,
 		handleNavigateSession,
@@ -430,9 +563,17 @@ export function App() {
 							transcriptLoading={transcriptLoading}
 							onReload={handleReload}
 							expandThinking={expandThinking}
-							expandToolCalls={expandToolCalls}
+							expandRead={expandRead}
+							expandEdit={expandEdit}
+							expandOther={expandOther}
 							onToggleExpandThinking={handleToggleExpandThinking}
-							onToggleExpandToolCalls={handleToggleExpandToolCalls}
+							onToggleExpandRead={handleToggleExpandRead}
+							onToggleExpandEdit={handleToggleExpandEdit}
+							onToggleExpandOther={handleToggleExpandOther}
+							hasMore={hasMore}
+							isLoadingOlder={isLoadingOlder}
+							numPrepended={numPrepended}
+							onLoadOlder={loadOlderEntries}
 						/>
 					</>
 				) : (

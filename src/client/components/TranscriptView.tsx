@@ -1,7 +1,43 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ItemProps, Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { formatNumber, formatTime, formatToolInput } from '../../shared/formatters.ts';
+import { getLanguageFromPath } from '../../shared/languages.ts';
+import { getExpandGroup, getToolCategory } from '../../shared/tools.ts';
 import type { ParsedEntry, ParsedToolResult, Session, TokenStats } from '../../types.ts';
 import { useConfig } from '../ConfigContext.tsx';
+import { EntryProvider, type ExpandState, useEntryContext } from '../EntryContext.tsx';
+import { CodeBlock } from './CodeBlock.tsx';
+import { CopyButton } from './CopyButton.tsx';
+import { LazyDiffView } from './LazyDiffView.tsx';
+import { Markdown } from './Markdown.tsx';
+
+// Fractional item size measurement for sub-pixel accuracy
+function fractionalItemSize(element: HTMLElement) {
+	return element.getBoundingClientRect().height;
+}
+
+// Large offset for stable prepending (Virtuoso pattern)
+const PREPEND_OFFSET = 10_000_000;
+
+// Context passed to Virtuoso - allows us to control index-to-item mapping
+// instead of letting Virtuoso manage it via data prop (which breaks on prepend)
+type VirtuosoContext = {
+	displayEntries: ParsedEntry[];
+	numPrepended: number;
+};
+
+// Calculate real array index from Virtuoso's virtual index
+// When items prepend, firstItemIndex decreases, so virtuosoIndex + numPrepended
+// maps back to the correct position in the actual array
+function calculateItemIndex(virtuosoIndex: number, numPrepended: number): number {
+	return virtuosoIndex + numPrepended - PREPEND_OFFSET;
+}
+
+// Item wrapper traps CSS margins, preventing measurement errors
+// Using VirtuosoContext as the second generic type parameter
+const VirtuosoItem = React.forwardRef<HTMLDivElement, ItemProps<unknown>>((props, ref) => (
+	<div {...props} ref={ref} style={{ display: 'inline-block', width: '100%' }} />
+));
 
 interface TranscriptViewProps {
 	session: Session;
@@ -11,9 +47,18 @@ interface TranscriptViewProps {
 	transcriptLoading: boolean;
 	onReload: () => void;
 	expandThinking: boolean | null;
-	expandToolCalls: boolean | null;
+	expandRead: boolean | null;
+	expandEdit: boolean | null;
+	expandOther: boolean | null;
 	onToggleExpandThinking: () => void;
-	onToggleExpandToolCalls: () => void;
+	onToggleExpandRead: () => void;
+	onToggleExpandEdit: () => void;
+	onToggleExpandOther: () => void;
+	// Windowed loading
+	hasMore: boolean;
+	isLoadingOlder: boolean;
+	numPrepended: number;
+	onLoadOlder: () => void;
 }
 
 export function TranscriptView({
@@ -24,47 +69,58 @@ export function TranscriptView({
 	transcriptLoading,
 	onReload,
 	expandThinking,
-	expandToolCalls,
+	expandRead,
+	expandEdit,
+	expandOther,
 	onToggleExpandThinking,
-	onToggleExpandToolCalls,
+	onToggleExpandRead,
+	onToggleExpandEdit,
+	onToggleExpandOther,
+	hasMore,
+	isLoadingOlder,
+	numPrepended,
+	onLoadOlder,
 }: TranscriptViewProps) {
 	const { config } = useConfig();
-	const containerRef = useRef<HTMLDivElement>(null);
-	const lastScrollTopRef = useRef(0);
-	const [currentPage, setCurrentPage] = useState(1);
+	const virtuosoRef = useRef<VirtuosoHandle>(null);
+	const isAtBottomRef = useRef(true);
 	const [shouldAutoscroll, setShouldAutoscroll] = useState(true);
+	const [hasNewEntries, setHasNewEntries] = useState(false);
 
-	const pageSize = config.pageSize || 500;
-
-	// Effective expand state (null means use config default)
+	// Effective expand states (null means use config default)
 	const effectiveExpandThinking = expandThinking ?? config.defaultExpandThinking;
-	const effectiveExpandToolCalls = expandToolCalls ?? config.defaultExpandToolCalls;
+	const effectiveExpandRead = expandRead ?? config.defaultExpandRead;
+	const effectiveExpandEdit = expandEdit ?? config.defaultExpandEdit;
+	const effectiveExpandOther = expandOther ?? config.defaultExpandOther;
 
-	// Build tool result map and filter displayable entries
+	// Memoized expand state object for context (stable reference)
+	const expandState: ExpandState = useMemo(
+		() => ({
+			thinking: effectiveExpandThinking,
+			read: effectiveExpandRead,
+			edit: effectiveExpandEdit,
+			other: effectiveExpandOther,
+		}),
+		[effectiveExpandThinking, effectiveExpandRead, effectiveExpandEdit, effectiveExpandOther],
+	);
+
+	// Build tool result map for inline display via getToolResult()
+	// Tool results are never displayed as separate entries - they appear inline in ToolCallBlock
+	// This makes displayEntries strictly append-only (critical for Virtuoso stability)
 	const toolResultMapRef = useRef<Map<string, ParsedToolResult>>(new Map());
 	const displayEntries = useMemo(() => {
 		const resultMap = new Map<string, ParsedToolResult>();
-		const toolCallIds = new Set<string>();
 
 		for (const entry of entries) {
 			if (entry.type === 'tool_result' && entry.toolResult) {
 				resultMap.set(entry.toolResult.toolUseId, entry.toolResult);
 			}
-			if (entry.type === 'assistant' && entry.toolCalls) {
-				for (const tool of entry.toolCalls) {
-					toolCallIds.add(tool.id);
-				}
-			}
 		}
 
 		toolResultMapRef.current = resultMap;
 
-		return entries.filter((entry) => {
-			if (entry.type === 'tool_result' && entry.toolResult) {
-				return !toolCallIds.has(entry.toolResult.toolUseId);
-			}
-			return true;
-		});
+		// Filter out all tool_result entries - they display inline via getToolResult()
+		return entries.filter((entry) => entry.type !== 'tool_result');
 	}, [entries]);
 
 	// Stable callback for looking up tool results
@@ -73,109 +129,112 @@ export function TranscriptView({
 		[],
 	);
 
-	// Calculate pagination
-	const totalEntries = displayEntries.length;
-	const totalPages = Math.max(1, Math.ceil(totalEntries / pageSize));
+	// Track if this is the initial load for a session
+	const isInitialLoadRef = useRef(true);
 
-	// Page 1 is special: it's the LAST entries (newest) and can grow
-	// Other pages are static slices from the beginning
-	const getPageEntries = useCallback(() => {
-		if (totalEntries === 0) return [];
+	// NOTE: Removed manual scroll adjustment - testing if Virtuoso's native
+	// firstItemIndex handling works correctly when we don't interfere
 
-		if (currentPage === 1) {
-			// Page 1: newest entries (from end)
-			const startIdx = Math.max(0, totalEntries - pageSize);
-			return displayEntries.slice(startIdx);
-		}
-		// Other pages: older entries (from beginning), reverse page numbering
-		const reversePageIdx = totalPages - currentPage;
-		const startIdx = reversePageIdx * pageSize;
-		const endIdx = Math.min(startIdx + pageSize, totalEntries);
-		return displayEntries.slice(startIdx, endIdx);
-	}, [displayEntries, totalEntries, totalPages, currentPage, pageSize]);
-
-	const pageEntries = getPageEntries();
-
-	// Auto-reload when page 1 exceeds 2x pageSize
-	const page1Size = currentPage === 1 ? pageEntries.length : 0;
-	const maxPage1Size = pageSize * 2;
-
-	useEffect(() => {
-		if (currentPage === 1 && page1Size > maxPage1Size) {
-			onReload();
-		}
-	}, [currentPage, page1Size, maxPage1Size, onReload]);
-
-	// Reset to page 1 on session change
+	// Reset state on session change
 	// biome-ignore lint/correctness/useExhaustiveDependencies: session.id intentionally triggers reset
 	useEffect(() => {
-		setCurrentPage(1);
 		setShouldAutoscroll(true);
-		lastScrollTopRef.current = 0;
+		setHasNewEntries(false);
+		isAtBottomRef.current = true;
+		isInitialLoadRef.current = true;
 	}, [session.id]);
 
-	// Autoscroll: direction-based detection
-	// scrollTop decreased → user scrolled up → disable
-	// at bottom → re-enable
-	const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
-		const { scrollTop, scrollHeight, offsetHeight } = e.currentTarget;
-		const isAtBottom = scrollHeight - scrollTop - offsetHeight < 50;
+	// Scroll to bottom when entries first load for a new session
+	useEffect(() => {
+		if (isInitialLoadRef.current && displayEntries.length > 0 && virtuosoRef.current) {
+			isInitialLoadRef.current = false;
+			// Small delay to let Virtuoso finish rendering
+			setTimeout(() => {
+				virtuosoRef.current?.scrollToIndex({
+					index: displayEntries.length - 1,
+					align: 'end',
+					behavior: 'auto',
+				});
+			}, 50);
+		}
+	}, [displayEntries.length]);
 
-		if (scrollTop < lastScrollTopRef.current && !isAtBottom) {
-			setShouldAutoscroll(false);
-		} else if (isAtBottom) {
+	// Track at-bottom state for auto-scroll decisions
+	const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
+		isAtBottomRef.current = atBottom;
+		if (atBottom) {
+			setHasNewEntries(false);
 			setShouldAutoscroll(true);
 		}
-
-		lastScrollTopRef.current = scrollTop;
 	}, []);
 
-	// Autoscroll: scroll to bottom when new entries arrive (on page 1)
-	// biome-ignore lint/correctness/useExhaustiveDependencies: entries.length intentionally triggers scroll
-	useEffect(() => {
-		if (shouldAutoscroll && currentPage === 1 && containerRef.current) {
-			containerRef.current.scrollTop = containerRef.current.scrollHeight;
-		}
-	}, [entries.length, shouldAutoscroll, currentPage]);
+	// Load older entries when at top (stream-chat-react pattern)
+	// Uses atTopStateChange instead of startReached for more reliable triggering
+	const handleAtTopStateChange = useCallback(
+		(isAtTop: boolean) => {
+			if (isAtTop && hasMore && !isLoadingOlder) {
+				onLoadOlder();
+			}
+		},
+		[hasMore, isLoadingOlder, onLoadOlder],
+	);
+
+	// Virtuoso followOutput: auto-scroll when at bottom
+	// Uses 'auto' (instant scroll) instead of 'smooth' for high-throughput SSE updates
+	// to prevent visible animation causing layout shifts
+	const followOutput = useCallback(
+		(isAtBottom: boolean) => {
+			if (!shouldAutoscroll) return false;
+			if (!isAtBottom) {
+				setHasNewEntries(true);
+				return false;
+			}
+			return 'auto';
+		},
+		[shouldAutoscroll],
+	);
 
 	// Manual autoscroll toggle (for button click)
 	const handleAutoscrollToggle = useCallback(() => {
 		const newValue = !shouldAutoscroll;
 		setShouldAutoscroll(newValue);
-		if (newValue && containerRef.current) {
-			containerRef.current.scrollTop = containerRef.current.scrollHeight;
+		if (newValue && virtuosoRef.current && displayEntries.length > 0) {
+			virtuosoRef.current.scrollToIndex({
+				index: displayEntries.length - 1,
+				behavior: 'smooth',
+			});
+			setHasNewEntries(false);
 		}
-	}, [shouldAutoscroll]);
+	}, [shouldAutoscroll, displayEntries.length]);
 
 	// Enable autoscroll and scroll to bottom (for keyboard shortcut)
 	const handleAutoscrollEnable = useCallback(() => {
 		setShouldAutoscroll(true);
-		if (containerRef.current) {
-			containerRef.current.scrollTop = containerRef.current.scrollHeight;
+		setHasNewEntries(false);
+		if (virtuosoRef.current && displayEntries.length > 0) {
+			virtuosoRef.current.scrollToIndex({
+				index: displayEntries.length - 1,
+				behavior: 'smooth',
+			});
 		}
-	}, []);
+	}, [displayEntries.length]);
 
-	// Page navigation
-	const handlePrevPage = useCallback(() => {
-		if (currentPage < totalPages) {
-			setCurrentPage((p) => p + 1);
-			setShouldAutoscroll(false);
+	// Jump to newest entries (floating button)
+	const handleJumpToLatest = useCallback(() => {
+		if (virtuosoRef.current && displayEntries.length > 0) {
+			virtuosoRef.current.scrollToIndex({
+				index: displayEntries.length - 1,
+				behavior: 'smooth',
+			});
 		}
-	}, [currentPage, totalPages]);
-
-	const handleNextPage = useCallback(() => {
-		if (currentPage > 1) {
-			setCurrentPage((p) => p - 1);
-			if (currentPage === 2) {
-				setShouldAutoscroll(true);
-			}
-		}
-	}, [currentPage]);
+		setHasNewEntries(false);
+		setShouldAutoscroll(true);
+	}, [displayEntries.length]);
 
 	const handleReload = useCallback(() => {
-		setCurrentPage(1);
 		setShouldAutoscroll(true);
-		lastScrollTopRef.current = 0;
+		setHasNewEntries(false);
+		isAtBottomRef.current = true;
 		onReload();
 	}, [onReload]);
 
@@ -200,6 +259,35 @@ export function TranscriptView({
 		return () => window.removeEventListener('keydown', handleKeyDown);
 	}, [handleAutoscrollEnable, handleReload]);
 
+	// Memoized context for Virtuoso - changes when entries or numPrepended change
+	const virtuosoContext = useMemo<VirtuosoContext>(
+		() => ({ displayEntries, numPrepended }),
+		[displayEntries, numPrepended],
+	);
+
+	// Compute stable key from entry ID using context
+	// We control the index-to-item mapping, not Virtuoso
+	const computeItemKey = useCallback(
+		(virtuosoIndex: number, _data: unknown, context: VirtuosoContext) => {
+			const realIndex = calculateItemIndex(virtuosoIndex, context.numPrepended);
+			const entry = context.displayEntries[realIndex];
+			return entry?.id ?? `fallback-${virtuosoIndex}`;
+		},
+		[],
+	);
+
+	// Render function for Virtuoso - uses context to map virtuosoIndex to real entry
+	// This is the key pattern from stream-chat-react: we control the mapping
+	const itemContent = useCallback(
+		(virtuosoIndex: number, _data: unknown, context: VirtuosoContext) => {
+			const realIndex = calculateItemIndex(virtuosoIndex, context.numPrepended);
+			const entry = context.displayEntries[realIndex];
+			if (!entry) return <div style={{ height: '1px' }} />;
+			return <MemoizedEntryCard entry={entry} entriesCount={context.displayEntries.length} />;
+		},
+		[],
+	);
+
 	return (
 		<div className="transcript-view">
 			<header className="transcript-header">
@@ -207,7 +295,9 @@ export function TranscriptView({
 					<span className="session-type-badge">{session.type}</span>
 					{sessionTitle && <span className="session-title">{sessionTitle}</span>}
 					<span className="session-id">{session.id}</span>
-					{session.active && <span className="active-badge">&#x26A1; Active</span>}
+					{Date.now() - session.mtime < config.activeThresholdMs && (
+						<span className="active-badge">&#x26A1; Active</span>
+					)}
 				</div>
 				{tokens && (
 					<div className="token-stats">
@@ -222,17 +312,33 @@ export function TranscriptView({
 						type="button"
 						className={`expand-toggle ${effectiveExpandThinking ? 'active' : ''}`}
 						onClick={onToggleExpandThinking}
-						title={`${effectiveExpandThinking ? 'Thinking expanded' : 'Thinking collapsed'} (Shift+Alt+T)`}
+						title="Toggle thinking blocks (Shift+Alt+T)"
 					>
-						&#x1F4AD; {effectiveExpandThinking ? 'Expanded' : 'Collapsed'}
+						&#x1F4AD; Think
 					</button>
 					<button
 						type="button"
-						className={`expand-toggle ${effectiveExpandToolCalls ? 'active' : ''}`}
-						onClick={onToggleExpandToolCalls}
-						title={`${effectiveExpandToolCalls ? 'Tools expanded' : 'Tools collapsed'} (Shift+Alt+O)`}
+						className={`expand-toggle ${effectiveExpandRead ? 'active' : ''}`}
+						onClick={onToggleExpandRead}
+						title="Toggle Read tool results"
 					>
-						&#x1F527; {effectiveExpandToolCalls ? 'Expanded' : 'Collapsed'}
+						&#x1F4D6; Read
+					</button>
+					<button
+						type="button"
+						className={`expand-toggle ${effectiveExpandEdit ? 'active' : ''}`}
+						onClick={onToggleExpandEdit}
+						title="Toggle Edit/Write tool results (Shift+Alt+E)"
+					>
+						&#x270F;&#xFE0F; Edit
+					</button>
+					<button
+						type="button"
+						className={`expand-toggle ${effectiveExpandOther ? 'active' : ''}`}
+						onClick={onToggleExpandOther}
+						title="Toggle other tool results (Shift+Alt+O)"
+					>
+						&#x1F527; Other
 					</button>
 				</div>
 				<button
@@ -253,57 +359,60 @@ export function TranscriptView({
 				</button>
 			</header>
 
-			<div className="entries-container" ref={containerRef} onScroll={handleScroll}>
+			<div className="entries-container">
 				{transcriptLoading ? (
 					<div className="loading-entries">Loading transcript...</div>
-				) : pageEntries.length === 0 ? (
+				) : displayEntries.length === 0 ? (
 					<div className="empty-transcript">No entries in this transcript</div>
 				) : (
-					pageEntries.map((entry) => (
-						<MemoizedEntryCard
-							key={entry.id}
-							entry={entry}
-							expandThinking={effectiveExpandThinking}
-							expandToolCalls={effectiveExpandToolCalls}
-							getToolResult={getToolResult}
+					<EntryProvider expandState={expandState} getToolResult={getToolResult}>
+						<Virtuoso<unknown, VirtuosoContext>
+							key={session.id}
+							ref={virtuosoRef}
+							// totalCount + context pattern: we control index-to-item mapping
+							// instead of letting Virtuoso manage it via data prop
+							totalCount={displayEntries.length}
+							context={virtuosoContext}
+							computeItemKey={computeItemKey}
+							itemContent={itemContent}
+							itemSize={fractionalItemSize}
+							firstItemIndex={PREPEND_OFFSET - numPrepended}
+							followOutput={followOutput}
+							atBottomStateChange={handleAtBottomStateChange}
+							atBottomThreshold={100}
+							atTopStateChange={handleAtTopStateChange}
+							increaseViewportBy={{ top: 0, bottom: 200 }}
+							style={{ height: '100%' }}
+							components={{
+								Item: VirtuosoItem,
+								Header: () => {
+									// Fixed height to prevent layout shifts when loading state changes
+									const showContent = isLoadingOlder || hasMore;
+									return (
+										<div style={{ height: showContent ? '40px' : '0px', overflow: 'hidden' }}>
+											{isLoadingOlder && (
+												<div className="loading-older">Loading older entries...</div>
+											)}
+											{!isLoadingOlder && hasMore && (
+												<div className="has-more-indicator">Scroll up to load more</div>
+											)}
+										</div>
+									);
+								},
+							}}
 						/>
-					))
+					</EntryProvider>
 				)}
 			</div>
 
-			<footer className="pagination-footer">
-				{totalPages > 1 && (
-					<button
-						type="button"
-						className="page-btn"
-						onClick={handlePrevPage}
-						disabled={currentPage >= totalPages}
-						title="View older entries"
-					>
-						&#x25C0; Older
-					</button>
-				)}
-				<span className="page-info">
-					{totalPages > 1 ? (
-						<>
-							Page {currentPage} of {totalPages} ({totalEntries} total, showing {pageEntries.length}
-							)
-						</>
-					) : (
-						<>{totalEntries} entries</>
-					)}
-				</span>
-				{totalPages > 1 && (
-					<button
-						type="button"
-						className="page-btn"
-						onClick={handleNextPage}
-						disabled={currentPage <= 1}
-						title="View newer entries"
-					>
-						Newer &#x25B6;
-					</button>
-				)}
+			{hasNewEntries && (
+				<button type="button" className="new-entries-indicator" onClick={handleJumpToLatest}>
+					New entries &#x2193;
+				</button>
+			)}
+
+			<footer className="transcript-footer">
+				<span className="entry-count">{displayEntries.length} entries</span>
 			</footer>
 		</div>
 	);
@@ -311,31 +420,23 @@ export function TranscriptView({
 
 interface EntryCardProps {
 	entry: ParsedEntry;
-	expandThinking: boolean;
-	expandToolCalls: boolean;
-	getToolResult: (toolUseId: string) => ParsedToolResult | undefined;
+	entriesCount: number; // Busts memo when entries change (tool results arrive)
 }
 
 const MemoizedEntryCard = memo(function EntryCard({
 	entry,
-	expandThinking,
-	expandToolCalls,
-	getToolResult,
+	entriesCount: _entriesCount, // Used to bust memo, not directly
 }: EntryCardProps) {
+	const { expandState } = useEntryContext();
+
 	switch (entry.type) {
 		case 'user':
 			return <MemoizedUserEntry entry={entry} />;
 		case 'assistant':
-			return (
-				<MemoizedAssistantEntry
-					entry={entry}
-					expandThinking={expandThinking}
-					expandToolCalls={expandToolCalls}
-					getToolResult={getToolResult}
-				/>
-			);
+			return <MemoizedAssistantEntry entry={entry} />;
 		case 'tool_result':
-			return <MemoizedToolResultEntry entry={entry} expanded={expandToolCalls} />;
+			// Tool results are filtered out in displayEntries - this is a safety fallback
+			return <MemoizedToolResultEntry entry={entry} expanded={expandState.other} />;
 		case 'system':
 			return <MemoizedSystemEntry entry={entry} />;
 		default:
@@ -349,77 +450,101 @@ const MemoizedUserEntry = memo(function UserEntry({ entry }: { entry: ParsedEntr
 			<div className="entry-header">
 				<span className="role-badge user">USER</span>
 				<span className="timestamp">{formatTime(entry.timestamp)}</span>
+				{entry.content && <CopyButton content={entry.content} title="Copy message" />}
 			</div>
-			<div className="entry-content">
-				<pre>{entry.content}</pre>
-			</div>
+			<div className="entry-content">{entry.content && <Markdown content={entry.content} />}</div>
 		</div>
 	);
 });
 
 interface AssistantEntryProps {
 	entry: ParsedEntry;
-	expandThinking: boolean;
-	expandToolCalls: boolean;
-	getToolResult: (toolUseId: string) => ParsedToolResult | undefined;
 }
 
-const MemoizedAssistantEntry = memo(function AssistantEntry({
-	entry,
-	expandThinking,
-	expandToolCalls,
-	getToolResult,
-}: AssistantEntryProps) {
-	return (
-		<div className="entry assistant-entry">
-			<div className="entry-header">
-				<span className="role-badge assistant">ASSISTANT</span>
-				<span className="timestamp">{formatTime(entry.timestamp)}</span>
-				{entry.tokens && (
-					<span className="tokens-badge">
-						{formatNumber(entry.tokens.input_tokens || 0)} in /{' '}
-						{formatNumber(entry.tokens.output_tokens || 0)} out
-					</span>
-				)}
-			</div>
+const MemoizedAssistantEntry = memo(function AssistantEntry({ entry }: AssistantEntryProps) {
+	const { expandState, getToolResult } = useEntryContext();
 
+	return (
+		<>
+			{/* Thinking: separate box */}
 			{entry.thinking && (
-				<details className="thinking-block" open={expandThinking}>
-					<summary>&#x1F4AD; Thinking...</summary>
-					<pre>{entry.thinking}</pre>
+				<details className="entry thinking-entry" open={expandState.thinking}>
+					<summary className="entry-header">
+						<span className="role-badge thinking">THINKING</span>
+						<span className="timestamp">{formatTime(entry.timestamp)}</span>
+						<CopyButton content={entry.thinking} title="Copy thinking" />
+					</summary>
+					<pre className="entry-content thinking-content">{entry.thinking}</pre>
 				</details>
 			)}
 
+			{/* Assistant text: separate box */}
 			{entry.content && (
-				<div className="entry-content">
-					<pre>{entry.content}</pre>
+				<div className="entry assistant-entry">
+					<div className="entry-header">
+						<span className="role-badge assistant">ASSISTANT</span>
+						<span className="timestamp">{formatTime(entry.timestamp)}</span>
+						{entry.tokens && (
+							<span className="tokens-badge">
+								{formatNumber(entry.tokens.input_tokens || 0)} in /{' '}
+								{formatNumber(entry.tokens.output_tokens || 0)} out
+							</span>
+						)}
+						<CopyButton content={entry.content} title="Copy response" />
+					</div>
+					<div className="entry-content">
+						<Markdown content={entry.content} />
+					</div>
 				</div>
 			)}
 
-			{entry.toolCalls && entry.toolCalls.length > 0 && (
-				<div className="tool-calls">
-					{entry.toolCalls.map((tool) => (
-						<MemoizedToolCallBlock
-							key={tool.id}
-							tool={tool}
-							expanded={expandToolCalls}
-							result={getToolResult(tool.id)}
-						/>
-					))}
-				</div>
-			)}
-		</div>
+			{/* Tool calls: each is a separate box */}
+			{entry.toolCalls?.map((tool) => {
+				const category = getToolCategory(tool.name);
+				const expandGroup = getExpandGroup(category);
+				const expanded =
+					expandGroup === 'read'
+						? expandState.read
+						: expandGroup === 'edit'
+							? expandState.edit
+							: expandState.other;
+				return (
+					<MemoizedToolCallBlock
+						key={tool.id}
+						tool={tool}
+						category={category}
+						expanded={expanded}
+						result={getToolResult(tool.id)}
+					/>
+				);
+			})}
+		</>
 	);
 });
 
 interface ToolCallBlockProps {
 	tool: NonNullable<ParsedEntry['toolCalls']>[0];
+	category: import('../../shared/tools.ts').ToolCategory;
 	expanded: boolean;
 	result?: ParsedToolResult;
 }
 
+// Tool category icons
+const TOOL_ICONS: Record<import('../../shared/tools.ts').ToolCategory, string> = {
+	read: '\uD83D\uDCD6', // 📖
+	edit: '\u270F\uFE0F', // ✏️
+	bash: '\uD83D\uDCBB', // 💻
+	search: '\uD83D\uDD0D', // 🔍
+	web: '\uD83C\uDF10', // 🌐
+	task: '\uD83E\uDD16', // 🤖
+	mcp: '\uD83D\uDD0C', // 🔌
+	skill: '\u26A1', // ⚡
+	other: '\uD83D\uDD27', // 🔧
+};
+
 const MemoizedToolCallBlock = memo(function ToolCallBlock({
 	tool,
+	category,
 	expanded,
 	result,
 }: ToolCallBlockProps) {
@@ -428,10 +553,27 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 		[tool.name, tool.input],
 	);
 
+	const icon = TOOL_ICONS[category];
+	const filePath = tool.input?.file_path as string | undefined;
+	const isReadTool = category === 'read';
+	const isEditTool = tool.name === 'Edit' || tool.name === 'MultiEdit';
+	const isWriteTool = tool.name === 'Write';
+
+	// For Edit tool, extract old/new strings for diff view
+	const oldString = tool.input?.old_string as string | undefined;
+	const newString = tool.input?.new_string as string | undefined;
+	const hasDiff = isEditTool && oldString !== undefined && newString !== undefined;
+
+	// For Write tool, extract content for syntax-highlighted display
+	const writeContent = tool.input?.content as string | undefined;
+
 	return (
-		<details className="tool-call" open={expanded}>
-			<summary className="tool-name">
-				&#x1F527; <span className="name">[{tool.name}]</span> {summary}
+		<details className={`entry tool-entry tool-${category}`} open={expanded}>
+			<summary className="entry-header">
+				<span className={`role-badge tool-${category}`}>
+					{icon} {tool.name.toUpperCase()}
+				</span>
+				<span className="tool-summary">{summary}</span>
 				{result && (
 					<span
 						className={`result-indicator ${result.isError ? 'error' : 'success'}`}
@@ -441,13 +583,58 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 					</span>
 				)}
 			</summary>
-			{details && <pre className="tool-details">{details}</pre>}
-			{result && (
-				<div className={`tool-result-inline ${result.isError ? 'error' : ''}`}>
-					<div className="result-header">{result.isError ? '\u274C Error' : '\u2713 Result'}</div>
-					<pre className="result-content">{result.content}</pre>
-				</div>
-			)}
+
+			<div className="entry-content">
+				{/* Edit tool: show diff view from input */}
+				{hasDiff && (
+					<LazyDiffView
+						oldValue={oldString}
+						newValue={newString}
+						filePath={filePath}
+						maxHeight="400px"
+					/>
+				)}
+
+				{/* Write tool: show syntax-highlighted content from input */}
+				{isWriteTool && writeContent && (
+					<CodeBlock
+						code={writeContent}
+						filePath={filePath}
+						showLineNumbers={true}
+						maxHeight="400px"
+					/>
+				)}
+
+				{/* Other tools: show details */}
+				{!hasDiff && !isWriteTool && details && <pre className="tool-details">{details}</pre>}
+
+				{/* Edit/Write errors only show error message */}
+				{(hasDiff || isWriteTool) && result?.isError && (
+					<div className="tool-result-error">
+						<pre>{result.content}</pre>
+					</div>
+				)}
+
+				{/* Other tools: show full result */}
+				{!hasDiff && !isWriteTool && result && (
+					<div className={`tool-result ${result.isError ? 'error' : ''}`}>
+						<div className="result-label">
+							{result.isError ? '\u274C Error' : '\u2713 Result'}
+							<CopyButton content={result.content} title="Copy result" />
+						</div>
+						{isReadTool && filePath && getLanguageFromPath(filePath) ? (
+							<CodeBlock
+								code={result.content}
+								filePath={filePath}
+								showLineNumbers={true}
+								maxHeight="400px"
+							/>
+						) : (
+							<pre className="result-content">{result.content}</pre>
+						)}
+					</div>
+				)}
+			</div>
 		</details>
 	);
 });

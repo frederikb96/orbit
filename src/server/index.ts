@@ -10,6 +10,7 @@ import { extname, join } from 'node:path';
 import { getConfig } from '../lib/config.ts';
 import { getSessionManager, isValidSessionId } from '../lib/sessions.ts';
 import { parseTranscriptTail } from '../lib/transcript.ts';
+import { removePid, writePid } from '../shared/state.ts';
 import type { OrbitConfig, Session } from '../types.ts';
 import { createSSEHandler } from './sse.ts';
 
@@ -86,6 +87,7 @@ export class OrbitServer {
 			},
 		});
 
+		writePid(process.pid);
 		console.log(`Orbit server running at http://localhost:${port}`);
 	}
 
@@ -114,6 +116,7 @@ export class OrbitServer {
 		this.sessionManager.stopWatcher();
 		this.server?.stop();
 		this.server = null;
+		removePid();
 	}
 
 	/**
@@ -184,6 +187,32 @@ export class OrbitServer {
 			}
 
 			return this.sseHandler.createStream(session, this.config);
+		}
+
+		// POST /api/sessions/:id/name - Set session display name
+		const nameMatch = path.match(/^\/api\/sessions\/([^/]+)\/name$/);
+		if (nameMatch && req.method === 'POST') {
+			const id = nameMatch[1];
+
+			if (!isValidSessionId(id)) {
+				return Response.json({ error: 'Invalid session ID' }, { status: 400 });
+			}
+
+			try {
+				const body = (await req.json()) as { name: string };
+				if (!body.name || typeof body.name !== 'string') {
+					return Response.json({ error: 'Name is required' }, { status: 400 });
+				}
+
+				const success = this.sessionManager.setSessionName(id, body.name.trim());
+				if (!success) {
+					return Response.json({ error: 'Session not found' }, { status: 404 });
+				}
+
+				return Response.json({ success: true });
+			} catch {
+				return Response.json({ error: 'Invalid request body' }, { status: 400 });
+			}
 		}
 
 		// POST /api/session-titles - Batch fetch titles

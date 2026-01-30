@@ -10,7 +10,6 @@ export interface OrbitConfig {
 		count: number; // Number of sessions to track, default 10
 		refreshIntervalMs: number; // Refresh interval, default 5000
 		watchPath: string; // Base path, default ~/.claude/projects
-		activeThresholdMs: number; // Session active if modified within this time, default 60000
 	};
 	transcript: {
 		initialLines: number; // Lines to load initially, default 100
@@ -24,7 +23,9 @@ export interface OrbitConfig {
 // UI configuration (sent to client)
 export interface UIConfig {
 	defaultExpandThinking: boolean;
-	defaultExpandToolCalls: boolean;
+	defaultExpandRead: boolean; // Read tool results
+	defaultExpandEdit: boolean; // Edit/Write/MultiEdit tools
+	defaultExpandOther: boolean; // All other tools (Bash, Glob, etc.)
 	pageSize: number; // Entries per page (default 500)
 	maxSessions: number; // Limit sidebar sessions, 0 = unlimited
 	sessionPollIntervalMs: number; // Client poll interval, 0 = disabled
@@ -32,6 +33,7 @@ export interface UIConfig {
 	sseMaxRetries: number; // Max SSE reconnect attempts
 	sseBaseDelayMs: number; // Base delay for SSE reconnect
 	sseMaxDelayMs: number; // Max delay for SSE reconnect
+	activeThresholdMs: number; // Session considered active if modified within this time
 	sessionTitleCommand?: string; // Bash command to fetch session title, {sessionId} placeholder
 	sessionTitleIntervalMs?: number; // Interval to refresh titles (default 15000)
 }
@@ -45,7 +47,8 @@ export interface Session {
 	type: SessionType;
 	lastSeen: number; // mtime in ms
 	mtime: number; // alias for lastSeen (client compatibility)
-	active: boolean; // true if modified within activeThresholdMs
+	active: boolean; // Deprecated - client computes dynamically
+	name?: string; // Session name (set via REST endpoint)
 }
 
 // Transcript entry types (Claude Code JSONL format)

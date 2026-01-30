@@ -10,42 +10,10 @@
  * - orbit build - Build client bundle
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Command } from 'commander';
 import { getConfig } from './lib/config.ts';
-
-const STATE_DIR = join(homedir(), '.local', 'state', 'orbit');
-const PID_FILE = join(STATE_DIR, 'pid');
-
-function ensureStateDir(): void {
-	if (!existsSync(STATE_DIR)) {
-		mkdirSync(STATE_DIR, { recursive: true });
-	}
-}
-
-function readPid(): number | null {
-	if (!existsSync(PID_FILE)) return null;
-	try {
-		const content = readFileSync(PID_FILE, 'utf-8').trim();
-		const pid = Number.parseInt(content, 10);
-		return Number.isNaN(pid) ? null : pid;
-	} catch {
-		return null;
-	}
-}
-
-function writePid(pid: number): void {
-	ensureStateDir();
-	writeFileSync(PID_FILE, String(pid));
-}
-
-function removePid(): void {
-	if (existsSync(PID_FILE)) {
-		unlinkSync(PID_FILE);
-	}
-}
+import { readPid, removePid } from './shared/state.ts';
 
 function isProcessRunning(pid: number): boolean {
 	try {
@@ -108,10 +76,11 @@ program
 			process.exit(1);
 		}
 
-		// Write PID file - use the spawned process PID
-		writePid(proc.pid);
-
-		console.log(`Orbit started on http://localhost:${port} (PID: ${proc.pid})`);
+		// Server writes its own PID - read it back for display
+		const serverPid = readPid();
+		console.log(
+			`Orbit started on http://localhost:${port}${serverPid ? ` (PID: ${serverPid})` : ''}`,
+		);
 		process.exit(0);
 	});
 

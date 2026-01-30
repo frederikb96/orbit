@@ -19,10 +19,9 @@ const DEFAULT_CONFIG: OrbitConfig = {
 		count: 10,
 		refreshIntervalMs: 5000,
 		watchPath: join(homedir(), '.claude', 'projects'),
-		activeThresholdMs: 60_000,
 	},
 	transcript: {
-		initialLines: 0, // 0 = load all entries
+		initialLines: 50, // Initial entries to load (windowed loading)
 	},
 	ui: DEFAULT_UI_CONFIG,
 	server: {

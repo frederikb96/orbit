@@ -45,6 +45,7 @@ const NOTIFY_DEBOUNCE_MS = 500; // Increased to reduce SSE traffic during active
 export class SessionManager {
 	private config: OrbitConfig;
 	private sessions: Map<string, Session> = new Map();
+	private sessionNames: Map<string, string> = new Map();
 	private watcher: FSWatcher | null = null;
 	private listeners: Set<SessionChangeListener> = new Set();
 	private notifyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -160,17 +161,50 @@ export class SessionManager {
 
 	/**
 	 * Get all tracked sessions, sorted by lastSeen descending.
+	 * Includes session names if set.
 	 */
 	getSessions(): Session[] {
 		// Map is ordered oldest→newest, so reverse for display
-		return Array.from(this.sessions.values()).reverse();
+		return Array.from(this.sessions.values())
+			.reverse()
+			.map((session) => {
+				const name = this.sessionNames.get(session.id);
+				return name ? { ...session, name } : session;
+			});
 	}
 
 	/**
 	 * Get a specific session by ID.
 	 */
 	getSession(id: string): Session | undefined {
-		return this.sessions.get(id);
+		const session = this.sessions.get(id);
+		if (session) {
+			const name = this.sessionNames.get(id);
+			if (name) {
+				return { ...session, name };
+			}
+		}
+		return session;
+	}
+
+	/**
+	 * Set the display name for a session.
+	 * Notifies listeners of the change.
+	 */
+	setSessionName(id: string, name: string): boolean {
+		if (!this.sessions.has(id)) {
+			return false;
+		}
+		this.sessionNames.set(id, name);
+		this.scheduleNotify();
+		return true;
+	}
+
+	/**
+	 * Get the display name for a session.
+	 */
+	getSessionName(id: string): string | undefined {
+		return this.sessionNames.get(id);
 	}
 
 	/**
@@ -233,7 +267,7 @@ export class SessionManager {
 		}
 
 		const now = Date.now();
-		const active = now - mtimeMs < this.config.sessions.activeThresholdMs;
+		const active = now - mtimeMs < this.config.ui.activeThresholdMs;
 
 		return {
 			id,
@@ -252,6 +286,8 @@ let managerInstance: SessionManager | null = null;
 export function getSessionManager(config?: OrbitConfig): SessionManager {
 	if (!managerInstance) {
 		managerInstance = new SessionManager(config);
+	} else if (config) {
+		console.warn('SessionManager already initialized, config parameter ignored');
 	}
 	return managerInstance;
 }
