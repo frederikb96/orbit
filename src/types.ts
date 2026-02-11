@@ -36,6 +36,19 @@ export interface UIConfig {
 	activeThresholdMs: number; // Session considered active if modified within this time
 	sessionTitleCommand?: string; // Bash command to fetch session title, {sessionId} placeholder
 	sessionTitleIntervalMs?: number; // Interval to refresh titles (default 15000)
+	useV3DualMode: boolean; // Enable V3 dual-mode (Live/Archive views)
+	v3: V3Config; // V3-specific performance options
+}
+
+// V3-specific configuration
+export interface V3Config {
+	maxLiveEntries: number; // Max entries in Live buffer (default 100)
+	sseDebounceMs: number; // SSE batch debounce delay (default 500)
+	autoScrollThreshold: number; // Pixels from bottom to trigger auto-scroll (default 50)
+	archiveInitialLoad: number; // Initial entries to load in Archive (default 100)
+	archivePageSize: number; // Entries per page in Archive (default 50)
+	maxMemoryMB: number; // Memory warning threshold (default 200)
+	archiveMaxEntries: number; // Row 33: Hard limit on entries to prevent memory issues (default 10000)
 }
 
 // Session types
@@ -151,4 +164,44 @@ export interface SSEEvent {
 	entries?: ParsedEntry[];
 	cursor?: number;
 	hasMore?: boolean;
+}
+
+// V3 Dual-Mode Architecture Types
+
+export type ViewMode = 'live' | 'archive';
+
+export interface LiveState {
+	entries: ParsedEntry[]; // Current buffer (max N entries)
+	isConnected: boolean; // SSE connection status
+}
+
+export interface ArchiveState {
+	snapshotTimestamp: string; // Frozen cutoff time
+	entries: ParsedEntry[]; // Full loaded entries
+	isLoading: boolean; // Initial load in progress
+	loadingProgress: number; // 0-100 percentage
+	hasMore: boolean; // More pages to load
+	nextCursor: string | null; // For pagination
+	anchorEntryId: string | null; // For position preservation
+	newEntriesCount: number; // Counter for badge
+}
+
+export interface LiveViewConfig {
+	maxEntries: number; // Default: 100, cap for buffer
+	debounceMs: number; // Default: 500, SSE debounce
+	autoScrollThreshold: number; // Default: 50, pixels from bottom
+}
+
+export interface ArchiveViewConfig {
+	initialLoadCount: number; // Default: 100, entries for instant load
+	pageSize: number; // Default: 50, entries per background page
+	maxMemoryMB: number; // Default: 200, warn if exceeded
+}
+
+export interface ArchiveResponse {
+	entries: ParsedEntry[];
+	snapshotTimestamp: string;
+	totalCount: number;
+	hasMore: boolean;
+	nextCursor: string | null;
 }

@@ -5,10 +5,14 @@
  * with caching for repeated code blocks.
  */
 
-import type { BundledLanguage, Highlighter } from 'shiki';
+import type { BundledLanguage, BundledTheme, Highlighter } from 'shiki';
 
 let highlighterPromise: Promise<Highlighter> | null = null;
 const htmlCache = new Map<string, string>();
+
+// Theme names for dark/light modes
+const DARK_THEME: BundledTheme = 'one-dark-pro';
+const LIGHT_THEME: BundledTheme = 'github-light';
 
 // Common languages to preload for faster first highlighting
 const PRELOAD_LANGS: BundledLanguage[] = [
@@ -21,6 +25,14 @@ const PRELOAD_LANGS: BundledLanguage[] = [
 ];
 
 /**
+ * Get the current theme based on document attribute.
+ */
+export function getCurrentTheme(): 'dark' | 'light' {
+	if (typeof document === 'undefined') return 'dark';
+	return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+}
+
+/**
  * Get or create the Shiki highlighter instance.
  * Lazy-loads Shiki WASM on first call.
  */
@@ -28,7 +40,7 @@ async function getHighlighter(): Promise<Highlighter> {
 	if (!highlighterPromise) {
 		highlighterPromise = import('shiki').then(({ createHighlighter }) =>
 			createHighlighter({
-				themes: ['one-dark-pro'],
+				themes: [DARK_THEME, LIGHT_THEME],
 				langs: PRELOAD_LANGS,
 			}),
 		);
@@ -54,8 +66,13 @@ function cacheKey(code: string, language: string): string {
  * Highlight code asynchronously with caching.
  * Returns highlighted HTML string or null if language not supported.
  */
-export async function highlightAsync(code: string, language: string): Promise<string | null> {
-	const key = cacheKey(code, language);
+export async function highlightAsync(
+	code: string,
+	language: string,
+	theme: 'dark' | 'light' = getCurrentTheme(),
+): Promise<string | null> {
+	const shikiTheme = theme === 'light' ? LIGHT_THEME : DARK_THEME;
+	const key = `${cacheKey(code, language)}:${theme}`;
 
 	// Check cache first
 	const cached = htmlCache.get(key);
@@ -77,7 +94,7 @@ export async function highlightAsync(code: string, language: string): Promise<st
 
 		const html = highlighter.codeToHtml(code, {
 			lang: language as BundledLanguage,
-			theme: 'one-dark-pro',
+			theme: shikiTheme,
 		});
 
 		// Cache the result

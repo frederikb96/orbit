@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SSE reconnection with exponential backoff and retry info indicator (configurable via `sseMaxRetries`, `sseBaseDelayMs`, `sseMaxDelayMs`)
+- Archive memory limit protection with configurable `archiveMaxEntries` (default 10,000)
+- Memory warning banner when archive loading is truncated due to limit
+- Loading progress percentage with entry count for large archives
 - Lazy syntax highlighting via Shiki with IntersectionObserver (zero main thread blocking)
 - LazyDiffView wrapper using React.lazy for deferred diff component loading
 - Async highlighter utility with content-based caching (`src/client/lib/highlighter.ts`)
@@ -27,8 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Copy to clipboard buttons on user messages, assistant responses, thinking blocks, and tool results
 - Light/dark/system theme toggle in sidebar header (persisted to localStorage)
 - Flash prevention script for theme loading
+- Shift+Alt+S keyboard shortcut to jump to bottom in Live view
+- Markdown rendering for thinking blocks (in addition to assistant messages)
 
 ### Changed
+
+- Code highlighting now respects theme (Shiki uses github-light for light mode, one-dark-pro for dark)
+- Diff view syntax highlighting respects theme (react-syntax-highlighter switches styles)
+- ReactDiffViewer respects theme (useDarkTheme prop now dynamic)
+
+### Fixed
+
+- "View Full History" indicator flickering when scrolling at threshold (400ms debounce)
+- "New entries" banner flickering during autoscroll (400ms debounce)
 
 - Visual refresh: GitHub-inspired dark theme with semantic palette (3 colors: accent, success, error)
 - Removed tool category colors in favor of monochrome styling (cleaner visual hierarchy)

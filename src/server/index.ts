@@ -30,7 +30,11 @@ interface SessionListClient {
 	pingInterval: ReturnType<typeof setInterval>;
 }
 
-const KEEP_ALIVE_INTERVAL_MS = 30_000;
+// Keepalive ping interval - 15 seconds prevents browser/proxy timeouts
+const KEEP_ALIVE_INTERVAL_MS = 15_000;
+
+// Max file size for archive endpoint (100MB) - prevents DoS from huge transcripts
+const ARCHIVE_MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024;
 
 export class OrbitServer {
 	private config: OrbitConfig;
@@ -53,7 +57,7 @@ export class OrbitServer {
 	async start(): Promise<void> {
 		// Initialize session manager
 		this.sessionManager.initialize();
-		this.sessionManager.startWatcher();
+		await this.sessionManager.startWatcher();
 
 		// Subscribe to session changes for SSE broadcast
 		this.unsubscribeSessionChanges = this.sessionManager.onChange((sessions) => {
@@ -68,6 +72,7 @@ export class OrbitServer {
 		this.server = Bun.serve({
 			hostname: 'localhost',
 			port,
+			idleTimeout: 30,
 			fetch: async (req) => {
 				const url = new URL(req.url);
 				const path = url.pathname;
@@ -94,7 +99,7 @@ export class OrbitServer {
 	/**
 	 * Stop the server.
 	 */
-	stop(): void {
+	async stop(): Promise<void> {
 		// Close session list SSE clients
 		for (const [clientId, client] of this.sessionListClients) {
 			clearInterval(client.pingInterval);
@@ -113,7 +118,7 @@ export class OrbitServer {
 		}
 
 		this.sseHandler.closeAll();
-		this.sessionManager.stopWatcher();
+		await this.sessionManager.stopWatcher();
 		this.server?.stop();
 		this.server = null;
 		removePid();
@@ -177,7 +182,7 @@ export class OrbitServer {
 			return Response.json(result);
 		}
 
-		// GET /api/sessions/:id/stream - SSE stream
+		// GET /api/sessions/:id/stream - SSE stream (legacy, sends init batch)
 		const streamMatch = path.match(/^\/api\/sessions\/([^/]+)\/stream$/);
 		if (streamMatch && req.method === 'GET') {
 			const id = streamMatch[1];
@@ -187,6 +192,46 @@ export class OrbitServer {
 			}
 
 			return this.sseHandler.createStream(session, this.config);
+		}
+
+		// GET /api/sessions/:id/live - Live SSE stream (V3 mode, no init batch)
+		const liveMatch = path.match(/^\/api\/sessions\/([^/]+)\/live$/);
+		if (liveMatch && req.method === 'GET') {
+			const id = liveMatch[1];
+			const session = this.sessionManager.getSession(id);
+			if (!session) {
+				return Response.json({ error: 'Session not found' }, { status: 404 });
+			}
+
+			return this.sseHandler.createLiveStream(session);
+		}
+
+		// GET /api/sessions/:id/archive - Paginated historical entries (V3 mode)
+		const archiveMatch = path.match(/^\/api\/sessions\/([^/]+)\/archive$/);
+		if (archiveMatch && req.method === 'GET') {
+			const id = archiveMatch[1];
+			const session = this.sessionManager.getSession(id);
+			if (!session) {
+				return Response.json({ error: 'Session not found' }, { status: 404 });
+			}
+
+			// Query params
+			const snapshotParam = url.searchParams.get('snapshot');
+			if (!snapshotParam) {
+				return Response.json({ error: 'snapshot parameter is required' }, { status: 400 });
+			}
+			const snapshot = Number.parseInt(snapshotParam, 10);
+			if (Number.isNaN(snapshot)) {
+				return Response.json({ error: 'Invalid snapshot parameter' }, { status: 400 });
+			}
+
+			const lastParam = url.searchParams.get('last');
+			const beforeParam = url.searchParams.get('before');
+			const limitParam = url.searchParams.get('limit');
+
+			const limit = Math.min(Math.max(1, Number.parseInt(limitParam || '50', 10)), 200);
+
+			return await this.handleArchiveRequest(session, snapshot, lastParam, beforeParam, limit);
 		}
 
 		// POST /api/sessions/:id/name - Set session display name
@@ -349,6 +394,102 @@ export class OrbitServer {
 				clearInterval(client.pingInterval);
 				this.sessionListClients.delete(clientId);
 			}
+		}
+	}
+
+	/**
+	 * Handle archive request for paginated historical entries.
+	 *
+	 * @param session - Session to fetch entries from
+	 * @param snapshot - Snapshot timestamp (entries must be before this time)
+	 * @param lastParam - If provided, return last N entries
+	 * @param beforeParam - If provided, return entries before this cursor (timestamp)
+	 * @param limit - Max entries to return
+	 */
+	private async handleArchiveRequest(
+		session: Session,
+		snapshot: number,
+		lastParam: string | null,
+		beforeParam: string | null,
+		limit: number,
+	): Promise<Response> {
+		try {
+			// Guard against DoS: check file size before loading entire transcript
+			const fileSize = Bun.file(session.path).size;
+			if (fileSize > ARCHIVE_MAX_FILE_SIZE_BYTES) {
+				const sizeMB = Math.round(fileSize / 1024 / 1024);
+				return Response.json(
+					{
+						error: `Transcript too large (${sizeMB}MB). Use Live mode for real-time streaming instead.`,
+						code: 'FILE_TOO_LARGE',
+						sizeMB,
+					},
+					{ status: 413 },
+				);
+			}
+
+			const snapshotTimestamp = Date.now();
+
+			// Parse all entries from file (limit 0 = all)
+			const { entries: allEntries } = await parseTranscriptTail(session.path, 0);
+
+			// Filter entries by snapshot time
+			const filteredEntries = allEntries.filter((entry) => {
+				if (!entry.timestamp) return true;
+				const entryTime = new Date(entry.timestamp).getTime();
+				return entryTime < snapshot;
+			});
+
+			const totalCount = filteredEntries.length;
+
+			let resultEntries: typeof filteredEntries;
+			let hasMore: boolean;
+			let nextCursor: string | null = null;
+
+			if (lastParam !== null) {
+				// Return last N entries
+				const last = Math.min(Math.max(1, Number.parseInt(lastParam, 10) || limit), 200);
+				const startIdx = Math.max(0, filteredEntries.length - last);
+				resultEntries = filteredEntries.slice(startIdx);
+				hasMore = startIdx > 0;
+				if (hasMore && resultEntries.length > 0) {
+					nextCursor = resultEntries[0].timestamp;
+				}
+			} else if (beforeParam !== null) {
+				// Return entries before cursor
+				const beforeTime = new Date(beforeParam).getTime();
+				const entriesBeforeCursor = filteredEntries.filter((entry) => {
+					if (!entry.timestamp) return false;
+					const entryTime = new Date(entry.timestamp).getTime();
+					return entryTime < beforeTime;
+				});
+
+				const startIdx = Math.max(0, entriesBeforeCursor.length - limit);
+				resultEntries = entriesBeforeCursor.slice(startIdx);
+				hasMore = startIdx > 0;
+				if (hasMore && resultEntries.length > 0) {
+					nextCursor = resultEntries[0].timestamp;
+				}
+			} else {
+				// Default: return last `limit` entries
+				const startIdx = Math.max(0, filteredEntries.length - limit);
+				resultEntries = filteredEntries.slice(startIdx);
+				hasMore = startIdx > 0;
+				if (hasMore && resultEntries.length > 0) {
+					nextCursor = resultEntries[0].timestamp;
+				}
+			}
+
+			return Response.json({
+				entries: resultEntries,
+				snapshotTimestamp,
+				totalCount,
+				hasMore,
+				nextCursor,
+			});
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			return Response.json({ error: message }, { status: 500 });
 		}
 	}
 

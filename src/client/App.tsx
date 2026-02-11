@@ -1,17 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ViewMode } from '../types.ts';
 
 /**
  * Batches rapid state updates into single updates at most every `delay` ms.
  * Accumulates new entries between flushes to prevent rapid re-renders from SSE bursts.
+ * Returns [appendFn, clearFn] - clearFn cancels pending batches (use on session switch).
  */
 function useBatchedAppend<T>(
 	setState: React.Dispatch<React.SetStateAction<{ entries: T[]; numPrepended: number }>>,
 	delay: number,
-): (items: T[]) => void {
+	maxEntries: number,
+): [(items: T[]) => void, () => void] {
 	const pendingRef = useRef<T[]>([]);
 	const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-	return useCallback(
+	const append = useCallback(
 		(items: T[]) => {
 			pendingRef.current = [...pendingRef.current, ...items];
 
@@ -22,20 +25,38 @@ function useBatchedAppend<T>(
 					timeoutRef.current = null;
 
 					if (batch.length > 0) {
-						// Append new entries (numPrepended unchanged - only used for prepending)
-						setState((prev) => ({
-							...prev,
-							entries: [...prev.entries, ...batch],
-						}));
+						// Append new entries with maxLiveEntries cap
+						setState((prev) => {
+							const combined = [...prev.entries, ...batch];
+							// Cap to maxEntries (keep most recent)
+							const capped = combined.length > maxEntries ? combined.slice(-maxEntries) : combined;
+							return {
+								...prev,
+								entries: capped,
+							};
+						});
 					}
 				}, delay);
 			}
 		},
-		[setState, delay],
+		[setState, delay, maxEntries],
 	);
+
+	// Clear pending batches (call on session switch to prevent contamination)
+	const clear = useCallback(() => {
+		pendingRef.current = [];
+		if (timeoutRef.current) {
+			clearTimeout(timeoutRef.current);
+			timeoutRef.current = null;
+		}
+	}, []);
+
+	return [append, clear];
 }
 import type { ParsedEntry, Session, TokenStats } from '../types.ts';
 import { useConfig } from './ConfigContext.tsx';
+import { ArchiveView } from './components/ArchiveView.tsx';
+import { LiveView } from './components/LiveView.tsx';
 import { Sidebar } from './components/Sidebar.tsx';
 import { TranscriptView } from './components/TranscriptView.tsx';
 
@@ -68,6 +89,21 @@ export function App() {
 	const [expandRead, setExpandRead] = useState<boolean | null>(null);
 	const [expandEdit, setExpandEdit] = useState<boolean | null>(null);
 	const [expandOther, setExpandOther] = useState<boolean | null>(null);
+
+	// V3 Dual-Mode state
+	const [viewMode, setViewMode] = useState<ViewMode>('live');
+	const [jumpToBottomTrigger, setJumpToBottomTrigger] = useState(0);
+	const [archiveSnapshotTimestamp, setArchiveSnapshotTimestamp] = useState<string>('');
+	const [archiveEntries, setArchiveEntries] = useState<ParsedEntry[]>([]);
+	const [archiveLoading, setArchiveLoading] = useState(false);
+	const [archiveProgress, setArchiveProgress] = useState(0);
+	const [archiveHasMore, setArchiveHasMore] = useState(false);
+	const [archiveCursor, setArchiveCursor] = useState<string | null>(null);
+	const [newEntriesSinceSnapshot, setNewEntriesSinceSnapshot] = useState(0);
+	const [isSSEConnected, setIsSSEConnected] = useState(false);
+	const [archiveTotalCount, setArchiveTotalCount] = useState<number>(0); // Row 32: Total entries for progress
+	const [archiveMemoryWarning, setArchiveMemoryWarning] = useState(false); // Row 33: Memory limit hit
+	const [archiveFirstItemIndex, setArchiveFirstItemIndex] = useState(100000); // Row 13: Virtual index offset for prepended content
 
 	// MRU (Most Recently Used) stack: ordered list of session IDs, index 0 = most recent
 	const [mruStack, setMruStack] = useState<string[]>([]);
@@ -114,8 +150,30 @@ export function App() {
 	// Ref to track current session ID (prevents cross-contamination during session switches)
 	const currentSessionIdRef = useRef<string | null>(null);
 
+	// Refs for entries/hasMore/cursor - used in keyboard handler to avoid re-registering on every SSE batch
+	const entriesRef = useRef<ParsedEntry[]>([]);
+	const hasMoreRef = useRef(false);
+	const cursorRef = useRef<number | null>(null);
+
+	// Keep refs in sync with state
+	entriesRef.current = entries;
+	hasMoreRef.current = hasMore;
+	cursorRef.current = cursor;
+
+	// Get maxLiveEntries from config
+	const maxLiveEntries = config.v3?.maxLiveEntries ?? 100;
+
 	// Batched entry append to prevent rapid re-renders from SSE bursts
-	const batchedAppendEntries = useBatchedAppend(setEntryState, 100);
+	// Returns [appendFn, clearFn] - clearFn prevents contamination on session switch
+	const [batchedAppendEntries, clearBatchedEntries] = useBatchedAppend(
+		setEntryState,
+		100,
+		maxLiveEntries,
+	);
+
+	// Ref for stable access to batchedAppendEntries in SSE effect
+	const batchedAppendEntriesRef = useRef(batchedAppendEntries);
+	batchedAppendEntriesRef.current = batchedAppendEntries;
 
 	// SSE connection for session list (push-based, no polling)
 	useEffect(() => {
@@ -125,6 +183,10 @@ export function App() {
 
 		const connect = () => {
 			eventSource = new EventSource('/api/sessions/stream');
+
+			eventSource.onopen = () => {
+				console.info('[SSE:SessionList] Connected');
+			};
 
 			eventSource.onmessage = (event) => {
 				try {
@@ -147,6 +209,10 @@ export function App() {
 			};
 
 			eventSource.onerror = () => {
+				const readyState = eventSource?.readyState;
+				console.warn(
+					`[SSE:SessionList] Error, readyState=${readyState}, attempt ${retryCount + 1}/${sseMaxRetries}`,
+				);
 				eventSource?.close();
 				retryCount++;
 
@@ -207,6 +273,10 @@ export function App() {
 		const connect = () => {
 			eventSource = new EventSource(`/api/sessions/${selectedSession.id}/stream`);
 
+			eventSource.onopen = () => {
+				console.info(`[SSE:Transcript] Connected to session ${selectedSession.id.slice(0, 8)}...`);
+			};
+
 			eventSource.onmessage = (event) => {
 				try {
 					const data = JSON.parse(event.data);
@@ -218,6 +288,7 @@ export function App() {
 
 					retryCount = 0;
 					setSseError(null);
+					setIsSSEConnected(true);
 
 					if (data.type === 'init') {
 						if (isFirstInit || data.entries.length > 0) {
@@ -235,8 +306,11 @@ export function App() {
 						const newEntries = data.entries as ParsedEntry[];
 						if (newEntries.length === 0) return;
 
-						// Batched append prevents rapid re-renders from SSE bursts
-						batchedAppendEntries(newEntries);
+						// Batched append via ref prevents SSE reconnects from dependency changes
+						batchedAppendEntriesRef.current(newEntries);
+
+						// Track new entries since archive snapshot (for badge in Archive mode)
+						setNewEntriesSinceSnapshot((prev) => prev + newEntries.length);
 
 						// Token updates are immediate since they're lightweight
 						setTokens((prev) => {
@@ -261,7 +335,12 @@ export function App() {
 			};
 
 			eventSource.onerror = () => {
+				const readyState = eventSource?.readyState;
+				console.warn(
+					`[SSE:Transcript] Error for session ${selectedSession?.id?.slice(0, 8)}, readyState=${readyState}, attempt ${retryCount + 1}/${sseMaxRetries}`,
+				);
 				eventSource?.close();
+				setIsSSEConnected(false);
 
 				retryCount++;
 				if (retryCount > sseMaxRetries) {
@@ -279,6 +358,7 @@ export function App() {
 
 		return () => {
 			eventSource?.close();
+			setIsSSEConnected(false);
 			if (retryTimeout) {
 				clearTimeout(retryTimeout);
 			}
@@ -289,21 +369,34 @@ export function App() {
 		sseMaxRetries,
 		sseBaseDelayMs,
 		sseMaxDelayMs,
-		batchedAppendEntries,
+		// batchedAppendEntries accessed via ref to prevent reconnects from callback changes
 	]);
 
-	const handleSelectSession = useCallback((session: Session) => {
-		setSelectedSession(session);
-		setEntryState({ entries: [], numPrepended: 0 });
-		setTokens(null);
-		setTranscriptLoading(true);
+	const handleSelectSession = useCallback(
+		(session: Session) => {
+			// Clear pending batched entries to prevent contamination from old session
+			clearBatchedEntries();
 
-		// Update MRU stack: move selected session to front
-		setMruStack((prev) => {
-			const filtered = prev.filter((id) => id !== session.id);
-			return [session.id, ...filtered];
-		});
-	}, []);
+			setSelectedSession(session);
+			setEntryState({ entries: [], numPrepended: 0 });
+			setTokens(null);
+			setTranscriptLoading(true);
+			// Always switch to Live mode when selecting a session
+			setViewMode('live');
+			// Reset archive state
+			setArchiveEntries([]);
+			setArchiveSnapshotTimestamp('');
+			setNewEntriesSinceSnapshot(0);
+			setArchiveFirstItemIndex(100000);
+
+			// Update MRU stack: move selected session to front
+			setMruStack((prev) => {
+				const filtered = prev.filter((id) => id !== session.id);
+				return [session.id, ...filtered];
+			});
+		},
+		[clearBatchedEntries],
+	);
 
 	const handleReload = useCallback(() => {
 		setEntryState({ entries: [], numPrepended: 0 });
@@ -458,6 +551,28 @@ export function App() {
 			if (!e.shiftKey || !e.altKey) return;
 
 			switch (e.key.toLowerCase()) {
+				case 'h':
+					// Toggle between Live and Archive mode
+					e.preventDefault();
+					setViewMode((prev) => {
+						if (prev === 'live') {
+							// Switching to Archive: capture snapshot atomically using refs
+							// This avoids race condition where entries arrive after snapshot but before reset
+							const snapshotEntries = entriesRef.current;
+							const snapshotHasMore = hasMoreRef.current;
+							const snapshotCursor = cursorRef.current;
+							setArchiveSnapshotTimestamp(new Date().toISOString());
+							setArchiveEntries([...snapshotEntries]);
+							setArchiveLoading(false);
+							setArchiveHasMore(snapshotHasMore);
+							// Copy the byte cursor for loading older entries in archive mode
+							setArchiveCursor(snapshotCursor !== null ? String(snapshotCursor) : null);
+							setNewEntriesSinceSnapshot(0);
+							return 'archive';
+						}
+						return 'live';
+					});
+					break;
 				case 't':
 					e.preventDefault();
 					handleToggleExpandThinking();
@@ -479,6 +594,11 @@ export function App() {
 				case '.':
 					e.preventDefault();
 					handleNavigateSession(1);
+					break;
+				case 's':
+					// Jump to bottom (enables autoscroll)
+					e.preventDefault();
+					setJumpToBottomTrigger((prev) => prev + 1);
 					break;
 			}
 		};
@@ -503,7 +623,144 @@ export function App() {
 		mruStack,
 		commitMruSelection,
 		handleNavigateSession,
+		// Note: entries and hasMore accessed via refs to avoid re-registering on every SSE batch
 	]);
+
+	// Row 33: Get max entries limit from config (default 10000)
+	const archiveMaxEntries = config.v3?.archiveMaxEntries ?? 10_000;
+
+	// Helper to apply memory limit to entries (Row 33)
+	const applyMemoryLimit = useCallback(
+		(sourceEntries: ParsedEntry[]) => {
+			const totalCount = sourceEntries.length;
+			const hitLimit = totalCount > archiveMaxEntries;
+			const limitedEntries = hitLimit
+				? sourceEntries.slice(-archiveMaxEntries) // Keep most recent entries
+				: sourceEntries;
+			return { limitedEntries, totalCount, hitLimit };
+		},
+		[archiveMaxEntries],
+	);
+
+	// V3 Mode handlers
+	const handleViewFullHistory = useCallback(() => {
+		const { limitedEntries, totalCount, hitLimit } = applyMemoryLimit(entries);
+		setArchiveSnapshotTimestamp(new Date().toISOString());
+		setArchiveEntries([...limitedEntries]);
+		setArchiveTotalCount(totalCount);
+		setArchiveMemoryWarning(hitLimit);
+		setArchiveLoading(false);
+		setArchiveHasMore(hasMore && !hitLimit); // Row 33: No more loading if limit hit
+		// Copy the byte cursor for loading older entries in archive mode
+		setArchiveCursor(cursor !== null ? String(cursor) : null);
+		setNewEntriesSinceSnapshot(0);
+		setArchiveFirstItemIndex(100000); // Row 13: Reset for fresh archive
+		setViewMode('archive');
+	}, [entries, hasMore, cursor, applyMemoryLimit]);
+
+	const handleSwitchToLive = useCallback(() => {
+		setViewMode('live');
+		setArchiveMemoryWarning(false); // Reset warning when switching back to live
+	}, []);
+
+	const handleArchiveRefresh = useCallback(() => {
+		const { limitedEntries, totalCount, hitLimit } = applyMemoryLimit(entries);
+		setArchiveSnapshotTimestamp(new Date().toISOString());
+		setArchiveEntries([...limitedEntries]);
+		setArchiveTotalCount(totalCount);
+		setArchiveMemoryWarning(hitLimit);
+		setArchiveLoading(false);
+		setArchiveHasMore(hasMore && !hitLimit);
+		// Copy the byte cursor for loading older entries in archive mode
+		setArchiveCursor(cursor !== null ? String(cursor) : null);
+		setNewEntriesSinceSnapshot(0);
+		setArchiveFirstItemIndex(100000); // Row 13: Reset for fresh archive
+	}, [entries, hasMore, cursor, applyMemoryLimit]);
+
+	const handleArchiveLoadMore = useCallback(async () => {
+		// Row 33: Check if already at memory limit
+		if (archiveEntries.length >= archiveMaxEntries) {
+			setArchiveHasMore(false);
+			setArchiveMemoryWarning(true);
+			return;
+		}
+
+		// Check if we have a cursor and session to load from
+		if (!archiveCursor || !selectedSession) {
+			setArchiveHasMore(false);
+			return;
+		}
+
+		// Prevent concurrent loads
+		if (archiveLoading) return;
+
+		setArchiveLoading(true);
+		try {
+			const byteCursor = Number.parseInt(archiveCursor, 10);
+			const response = await fetch(
+				`/api/sessions/${selectedSession.id}/entries?before=${byteCursor}&limit=50`,
+			);
+			if (!response.ok) throw new Error('Failed to load older entries');
+
+			const data = await response.json();
+			const olderEntries = data.entries as ParsedEntry[];
+
+			if (olderEntries.length > 0) {
+				// Row 13: Count only display entries (tool_result filtered out in ArchiveView)
+				const displayCount = olderEntries.filter((e) => e.type !== 'tool_result').length;
+
+				// Row 13: Decrease firstItemIndex BEFORE updating entries (for atomic Virtuoso update)
+				setArchiveFirstItemIndex((prev) => prev - displayCount);
+
+				// Prepend older entries to archive
+				setArchiveEntries((prev) => {
+					const combined = [...olderEntries, ...prev];
+					// Apply memory limit
+					if (combined.length > archiveMaxEntries) {
+						setArchiveMemoryWarning(true);
+						return combined.slice(-archiveMaxEntries);
+					}
+					return combined;
+				});
+				setArchiveTotalCount((prev) => prev + olderEntries.length);
+			}
+
+			// Update cursor and hasMore state
+			setArchiveCursor(data.cursor !== undefined ? String(data.cursor) : null);
+			setArchiveHasMore(data.hasMore ?? false);
+		} catch (err) {
+			console.error('Failed to load older archive entries:', err);
+			setArchiveHasMore(false);
+		} finally {
+			setArchiveLoading(false);
+		}
+	}, [archiveEntries.length, archiveMaxEntries, archiveCursor, selectedSession, archiveLoading]);
+
+	const handleJumpToBottom = useCallback(() => {
+		// Reset new entries counter when jumping to bottom
+		setNewEntriesSinceSnapshot(0);
+	}, []);
+
+	const handleToggleViewMode = useCallback(() => {
+		setViewMode((prev) => {
+			if (prev === 'live') {
+				const { limitedEntries, totalCount, hitLimit } = applyMemoryLimit(entries);
+				setArchiveSnapshotTimestamp(new Date().toISOString());
+				setArchiveEntries([...limitedEntries]);
+				setArchiveTotalCount(totalCount);
+				setArchiveMemoryWarning(hitLimit);
+				setArchiveLoading(false);
+				setArchiveHasMore(hasMore && !hitLimit);
+				// Copy the byte cursor for loading older entries in archive mode
+				setArchiveCursor(cursor !== null ? String(cursor) : null);
+				setNewEntriesSinceSnapshot(0);
+				setArchiveFirstItemIndex(100000); // Row 13: Reset for fresh archive
+				return 'archive';
+			}
+			setArchiveMemoryWarning(false);
+			return 'live';
+		});
+	}, [entries, hasMore, cursor, applyMemoryLimit]);
 
 	if (loading) {
 		return (
@@ -555,26 +812,78 @@ export function App() {
 								</button>
 							</div>
 						)}
-						<TranscriptView
-							session={selectedSession}
-							sessionTitle={sessionTitles[selectedSession.id] ?? null}
-							entries={entries}
-							tokens={tokens}
-							transcriptLoading={transcriptLoading}
-							onReload={handleReload}
-							expandThinking={expandThinking}
-							expandRead={expandRead}
-							expandEdit={expandEdit}
-							expandOther={expandOther}
-							onToggleExpandThinking={handleToggleExpandThinking}
-							onToggleExpandRead={handleToggleExpandRead}
-							onToggleExpandEdit={handleToggleExpandEdit}
-							onToggleExpandOther={handleToggleExpandOther}
-							hasMore={hasMore}
-							isLoadingOlder={isLoadingOlder}
-							numPrepended={numPrepended}
-							onLoadOlder={loadOlderEntries}
-						/>
+						{config.useV3DualMode ? (
+							// V3 Dual-Mode: LiveView or ArchiveView
+							viewMode === 'live' ? (
+								<LiveView
+									sessionId={selectedSession.id}
+									sessionTitle={sessionTitles[selectedSession.id] ?? null}
+									entries={entries}
+									tokens={tokens}
+									isConnected={isSSEConnected}
+									newEntriesCount={newEntriesSinceSnapshot}
+									jumpToBottomTrigger={jumpToBottomTrigger}
+									onJumpToBottom={handleJumpToBottom}
+									onViewFullHistory={handleViewFullHistory}
+									expandThinking={expandThinking}
+									expandRead={expandRead}
+									expandEdit={expandEdit}
+									expandOther={expandOther}
+									onToggleExpandThinking={handleToggleExpandThinking}
+									onToggleExpandRead={handleToggleExpandRead}
+									onToggleExpandEdit={handleToggleExpandEdit}
+									onToggleExpandOther={handleToggleExpandOther}
+								/>
+							) : (
+								<ArchiveView
+									session={selectedSession}
+									sessionTitle={sessionTitles[selectedSession.id] ?? null}
+									snapshotTimestamp={archiveSnapshotTimestamp}
+									entries={archiveEntries}
+									isLoading={archiveLoading}
+									loadingProgress={archiveProgress}
+									hasMore={archiveHasMore}
+									newEntriesCount={newEntriesSinceSnapshot}
+									tokens={tokens}
+									totalCount={archiveTotalCount}
+									memoryWarning={archiveMemoryWarning}
+									firstItemIndex={archiveFirstItemIndex}
+									onLoadMore={handleArchiveLoadMore}
+									onRefresh={handleArchiveRefresh}
+									onSwitchToLive={handleSwitchToLive}
+									expandThinking={expandThinking}
+									expandRead={expandRead}
+									expandEdit={expandEdit}
+									expandOther={expandOther}
+									onToggleExpandThinking={handleToggleExpandThinking}
+									onToggleExpandRead={handleToggleExpandRead}
+									onToggleExpandEdit={handleToggleExpandEdit}
+									onToggleExpandOther={handleToggleExpandOther}
+								/>
+							)
+						) : (
+							// Legacy TranscriptView
+							<TranscriptView
+								session={selectedSession}
+								sessionTitle={sessionTitles[selectedSession.id] ?? null}
+								entries={entries}
+								tokens={tokens}
+								transcriptLoading={transcriptLoading}
+								onReload={handleReload}
+								expandThinking={expandThinking}
+								expandRead={expandRead}
+								expandEdit={expandEdit}
+								expandOther={expandOther}
+								onToggleExpandThinking={handleToggleExpandThinking}
+								onToggleExpandRead={handleToggleExpandRead}
+								onToggleExpandEdit={handleToggleExpandEdit}
+								onToggleExpandOther={handleToggleExpandOther}
+								hasMore={hasMore}
+								isLoadingOlder={isLoadingOlder}
+								numPrepended={numPrepended}
+								onLoadOlder={loadOlderEntries}
+							/>
+						)}
 					</>
 				) : (
 					<div className="empty-state">

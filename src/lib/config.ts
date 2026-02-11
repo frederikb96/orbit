@@ -34,10 +34,15 @@ const DEFAULT_CONFIG: OrbitConfig = {
  * User values override defaults at any nesting level.
  */
 function mergeConfig(defaults: OrbitConfig, user: Partial<OrbitConfig>): OrbitConfig {
+	const userUi = user.ui as Partial<import('../types.ts').UIConfig> | undefined;
 	return {
 		sessions: { ...defaults.sessions, ...(user.sessions || {}) },
 		transcript: { ...defaults.transcript, ...(user.transcript || {}) },
-		ui: { ...defaults.ui, ...(user.ui || {}) },
+		ui: {
+			...defaults.ui,
+			...(userUi || {}),
+			v3: { ...defaults.ui.v3, ...(userUi?.v3 || {}) },
+		},
 		server: { ...defaults.server, ...(user.server || {}) },
 	};
 }

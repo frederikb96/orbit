@@ -7,7 +7,7 @@
 
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { getLanguageFromPath, normalizeLanguage } from '../../shared/languages.ts';
-import { highlightAsync, isLikelySupported } from '../lib/highlighter.ts';
+import { getCurrentTheme, highlightAsync, isLikelySupported } from '../lib/highlighter.ts';
 
 interface CodeBlockProps {
 	code: string;
@@ -29,12 +29,25 @@ export const CodeBlock = memo(function CodeBlock({
 	const containerRef = useRef<HTMLDivElement>(null);
 	const [highlightedHtml, setHighlightedHtml] = useState<string | null>(null);
 	const [isVisible, setIsVisible] = useState(false);
+	const [theme, setTheme] = useState<'dark' | 'light'>(getCurrentTheme);
 
 	const detectedLanguage = useMemo(() => {
 		if (language) return normalizeLanguage(language);
 		if (filePath) return getLanguageFromPath(filePath);
 		return 'text';
 	}, [language, filePath]);
+
+	// Listen for theme changes via MutationObserver
+	useEffect(() => {
+		const observer = new MutationObserver(() => {
+			setTheme(getCurrentTheme());
+		});
+		observer.observe(document.documentElement, {
+			attributes: true,
+			attributeFilter: ['data-theme'],
+		});
+		return () => observer.disconnect();
+	}, []);
 
 	// IntersectionObserver to detect when code block is visible
 	useEffect(() => {
@@ -55,15 +68,15 @@ export const CodeBlock = memo(function CodeBlock({
 		return () => observer.disconnect();
 	}, []);
 
-	// Highlight code when visible
+	// Highlight code when visible or theme changes
 	useEffect(() => {
-		if (!isVisible || highlightedHtml) return;
+		if (!isVisible) return;
 		if (!detectedLanguage || detectedLanguage === 'text') return;
 		if (!isLikelySupported(detectedLanguage)) return;
 
 		let cancelled = false;
 
-		highlightAsync(code, detectedLanguage).then((html) => {
+		highlightAsync(code, detectedLanguage, theme).then((html) => {
 			if (!cancelled && html) {
 				setHighlightedHtml(html);
 			}
@@ -72,7 +85,7 @@ export const CodeBlock = memo(function CodeBlock({
 		return () => {
 			cancelled = true;
 		};
-	}, [isVisible, code, detectedLanguage, highlightedHtml]);
+	}, [isVisible, code, detectedLanguage, theme]);
 
 	// Line numbers for raw display
 	const lineNumbers = useMemo(() => {

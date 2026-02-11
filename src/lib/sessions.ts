@@ -2,16 +2,15 @@
  * Session Manager Module
  *
  * Push-based session discovery with real-time updates.
- * Uses fs.watch events for incremental updates - no polling.
+ * Uses @parcel/watcher events for incremental updates - no polling.
  */
 
 import { existsSync } from 'node:fs';
-import type { FSWatcher } from 'node:fs';
 import { basename } from 'node:path';
 import type { OrbitConfig, Session, SessionType } from '../types.ts';
 import { getConfig } from './config.ts';
 import { getNewestNFiles } from './discovery.ts';
-import { createWatcher } from './watcher.ts';
+import { type DirectoryWatcher, createWatcher } from './watcher.ts';
 
 // Session filename patterns - single source of truth
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -46,7 +45,7 @@ export class SessionManager {
 	private config: OrbitConfig;
 	private sessions: Map<string, Session> = new Map();
 	private sessionNames: Map<string, string> = new Map();
-	private watcher: FSWatcher | null = null;
+	private watcher: DirectoryWatcher | null = null;
 	private listeners: Set<SessionChangeListener> = new Set();
 	private notifyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -81,12 +80,12 @@ export class SessionManager {
 	 * Start watching for file changes.
 	 * Events trigger incremental updates - no full rescans.
 	 */
-	startWatcher(): void {
+	async startWatcher(): Promise<void> {
 		if (this.watcher) {
 			return;
 		}
 
-		this.watcher = createWatcher(this.config.sessions.watchPath, (filePath) => {
+		this.watcher = await createWatcher(this.config.sessions.watchPath, (filePath) => {
 			this.handleFileEvent(filePath);
 		});
 	}
@@ -94,9 +93,9 @@ export class SessionManager {
 	/**
 	 * Stop the watcher and cleanup.
 	 */
-	stopWatcher(): void {
+	async stopWatcher(): Promise<void> {
 		if (this.watcher) {
-			this.watcher.close();
+			await this.watcher.close();
 			this.watcher = null;
 		}
 		if (this.notifyTimer) {
