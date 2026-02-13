@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - "View Full History" indicator flickering when scrolling at threshold (400ms debounce)
 - "New entries" banner flickering during autoscroll (400ms debounce)
+- SSE connection reliability: migrated per-file watcher from `fs.watch` to `@parcel/watcher`
+- SSE streams dropping silently when browser tab backgrounded (visibility-based reconnect)
+- Bun idle timeout too aggressive for long-lived SSE connections (30s → 255s max)
+- Race condition in SSE handler when client disconnects during async watcher setup
 
 - Visual refresh: GitHub-inspired dark theme with semantic palette (3 colors: accent, success, error)
 - Removed tool category colors in favor of monochrome styling (cleaner visual hierarchy)

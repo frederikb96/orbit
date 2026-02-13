@@ -72,7 +72,7 @@ export class OrbitServer {
 		this.server = Bun.serve({
 			hostname: 'localhost',
 			port,
-			idleTimeout: 30,
+			idleTimeout: 255,
 			fetch: async (req) => {
 				const url = new URL(req.url);
 				const path = url.pathname;

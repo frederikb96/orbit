@@ -147,6 +147,9 @@ export function App() {
 	const sseBaseDelayMs = config.sseBaseDelayMs;
 	const sseMaxDelayMs = config.sseMaxDelayMs;
 
+	// Visibility reconnect - force SSE reconnect when tab returns from background
+	const [visibilityReconnectTrigger, setVisibilityReconnectTrigger] = useState(0);
+
 	// Ref to track current session ID (prevents cross-contamination during session switches)
 	const currentSessionIdRef = useRef<string | null>(null);
 
@@ -176,6 +179,7 @@ export function App() {
 	batchedAppendEntriesRef.current = batchedAppendEntries;
 
 	// SSE connection for session list (push-based, no polling)
+	// biome-ignore lint/correctness/useExhaustiveDependencies: visibilityReconnectTrigger intentionally triggers reconnect
 	useEffect(() => {
 		let eventSource: EventSource | null = null;
 		let retryCount = 0;
@@ -235,7 +239,7 @@ export function App() {
 				clearTimeout(retryTimeout);
 			}
 		};
-	}, [sseMaxRetries, sseBaseDelayMs, sseMaxDelayMs]);
+	}, [sseMaxRetries, sseBaseDelayMs, sseMaxDelayMs, visibilityReconnectTrigger]);
 
 	// Manual refresh (for retry button)
 	const handleRefresh = useCallback(() => {
@@ -252,7 +256,7 @@ export function App() {
 	const [reloadTrigger, setReloadTrigger] = useState(0);
 
 	// Connect to SSE stream when session selected
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadTrigger intentionally triggers reconnect
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadTrigger/visibilityReconnectTrigger intentionally trigger reconnect
 	useEffect(() => {
 		if (!selectedSession) {
 			currentSessionIdRef.current = null;
@@ -366,6 +370,7 @@ export function App() {
 	}, [
 		selectedSession,
 		reloadTrigger,
+		visibilityReconnectTrigger,
 		sseMaxRetries,
 		sseBaseDelayMs,
 		sseMaxDelayMs,
@@ -405,6 +410,24 @@ export function App() {
 		setCursor(null);
 		setHasMore(false);
 		setReloadTrigger((prev) => prev + 1);
+	}, []);
+
+	// Reconnect SSE when tab returns from background (prevents stale connections)
+	useEffect(() => {
+		let hiddenAt: number | null = null;
+
+		const handleVisibilityChange = () => {
+			if (document.hidden) {
+				hiddenAt = Date.now();
+			} else if (hiddenAt && Date.now() - hiddenAt > 30_000) {
+				console.info('[SSE] Tab returned from background, forcing reconnect');
+				setVisibilityReconnectTrigger((prev) => prev + 1);
+				hiddenAt = null;
+			}
+		};
+
+		document.addEventListener('visibilitychange', handleVisibilityChange);
+		return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
 	}, []);
 
 	// Load older entries (windowed loading)

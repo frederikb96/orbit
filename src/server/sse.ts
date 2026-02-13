@@ -5,9 +5,8 @@
  * Watches session files and pushes new entries as they appear.
  */
 
-import type { FSWatcher } from 'node:fs';
 import { StreamingParser, parseTranscriptTail } from '../lib/transcript.ts';
-import { createFileWatcher } from '../lib/watcher.ts';
+import { type FileWatcher, createFileWatcher } from '../lib/watcher.ts';
 import type { OrbitConfig, ParsedEntry, Session } from '../types.ts';
 
 /**
@@ -83,7 +82,7 @@ interface SSEClient {
 	id: string;
 	sessionId: string;
 	controller: ReadableStreamDefaultController;
-	watcher: FSWatcher | null;
+	watcher: FileWatcher | null;
 	pingInterval: ReturnType<typeof setInterval> | null;
 }
 
@@ -108,7 +107,6 @@ export class SSEHandler {
 
 		const stream = new ReadableStream({
 			start: (controller) => {
-				let watcher: FSWatcher | null = null;
 				let pingInterval: ReturnType<typeof setInterval> | null = null;
 
 				// File change handler with debouncing
@@ -166,24 +164,31 @@ export class SSEHandler {
 					this.debounceTimers.set(clientId, timer);
 				};
 
-				// Start file watcher
-				try {
-					watcher = createFileWatcher(session.path, debouncedHandleFileChange);
-				} catch (err) {
-					console.error(`SSE file watcher failed for ${session.id}:`, err);
-				}
-
-				// Store client
+				// Store client (watcher set async below)
 				this.clients.set(clientId, {
 					id: clientId,
 					sessionId: session.id,
 					controller,
-					watcher,
+					watcher: null,
 					pingInterval: null,
 				});
 
-				// Send initial entries
+				// Start watcher + send initial entries (sequential async)
 				(async () => {
+					// Start watcher first so file changes during init are caught
+					try {
+						const w = await createFileWatcher(session.path, debouncedHandleFileChange);
+						const client = this.clients.get(clientId);
+						if (client) {
+							client.watcher = w;
+						} else {
+							w.close();
+							return;
+						}
+					} catch (err) {
+						console.error(`SSE file watcher failed for ${session.id}:`, err);
+					}
+
 					try {
 						const file = Bun.file(session.path);
 						lastPosition = file.size;
@@ -267,7 +272,6 @@ export class SSEHandler {
 
 		const stream = new ReadableStream({
 			start: (controller) => {
-				let watcher: FSWatcher | null = null;
 				let pingInterval: ReturnType<typeof setInterval> | null = null;
 
 				// Debouncer for batching new entries
@@ -329,14 +333,23 @@ export class SSEHandler {
 					this.debounceTimers.set(clientId, timer);
 				};
 
-				// Initialize position to current file size (don't send history)
+				// Store client (watcher set async below)
+				this.clients.set(clientId, {
+					id: clientId,
+					sessionId: session.id,
+					controller,
+					watcher: null,
+					pingInterval: null,
+				});
+
+				// Init position + start watcher (sequential async)
 				(async () => {
+					// Set position BEFORE watcher starts (prevents reading entire file on first event)
 					try {
 						const file = Bun.file(session.path);
 						lastPosition = file.size;
 						parser.setByteOffset(lastPosition);
 
-						// Send live_start event with snapshot timestamp (server clock)
 						const snapshotTimestamp = Date.now();
 						const initData = `data: ${JSON.stringify({
 							type: 'live_start',
@@ -347,23 +360,20 @@ export class SSEHandler {
 					} catch (err) {
 						console.error(`Live SSE init failed for ${session.id}:`, err);
 					}
+
+					// Start watcher AFTER position is set
+					try {
+						const w = await createFileWatcher(session.path, debouncedHandleFileChange);
+						const client = this.clients.get(clientId);
+						if (client) {
+							client.watcher = w;
+						} else {
+							w.close();
+						}
+					} catch (err) {
+						console.error(`Live SSE file watcher failed for ${session.id}:`, err);
+					}
 				})();
-
-				// Start file watcher
-				try {
-					watcher = createFileWatcher(session.path, debouncedHandleFileChange);
-				} catch (err) {
-					console.error(`Live SSE file watcher failed for ${session.id}:`, err);
-				}
-
-				// Store client with debouncer reference for cleanup
-				this.clients.set(clientId, {
-					id: clientId,
-					sessionId: session.id,
-					controller,
-					watcher,
-					pingInterval: null,
-				});
 
 				// Keep-alive ping
 				pingInterval = setInterval(() => {

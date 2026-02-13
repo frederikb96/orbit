@@ -5,11 +5,15 @@
  * Uses fs.watch for single-file monitoring.
  */
 
-import { type FSWatcher, watch } from 'node:fs';
+import { dirname } from 'node:path';
 import parcelWatcher from '@parcel/watcher';
 
 export interface DirectoryWatcher {
 	close(): Promise<void>;
+}
+
+export interface FileWatcher {
+	close(): void;
 }
 
 /**
@@ -41,21 +45,29 @@ export async function createWatcher(
 }
 
 /**
- * Create a watcher for a single file.
- *
- * @param filePath - Absolute path to the file to watch
- * @param onFileChange - Callback invoked when file changes
- * @returns FSWatcher instance
+ * Create a watcher for a single file using @parcel/watcher.
+ * Watches the parent directory and filters for the target file.
  */
-export function createFileWatcher(
+export async function createFileWatcher(
 	filePath: string,
 	onFileChange: (filePath: string) => void,
-): FSWatcher {
-	const watcher = watch(filePath, (event) => {
-		if (event === 'change') {
-			onFileChange(filePath);
+): Promise<FileWatcher> {
+	const dir = dirname(filePath);
+	const subscription = await parcelWatcher.subscribe(dir, (err, events) => {
+		if (err) {
+			console.error('File watcher error:', err);
+			return;
+		}
+		for (const event of events) {
+			if (event.path === filePath && (event.type === 'create' || event.type === 'update')) {
+				onFileChange(filePath);
+			}
 		}
 	});
 
-	return watcher;
+	return {
+		close() {
+			subscription.unsubscribe();
+		},
+	};
 }
