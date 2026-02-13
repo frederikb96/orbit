@@ -158,10 +158,14 @@ export function App() {
 	const hasMoreRef = useRef(false);
 	const cursorRef = useRef<number | null>(null);
 
+	// Ref for viewMode - used in keyboard handler to avoid re-registering
+	const viewModeRef = useRef<ViewMode>(viewMode);
+
 	// Keep refs in sync with state
 	entriesRef.current = entries;
 	hasMoreRef.current = hasMore;
 	cursorRef.current = cursor;
+	viewModeRef.current = viewMode;
 
 	// Get maxLiveEntries from config
 	const maxLiveEntries = config.v3?.maxLiveEntries ?? 100;
@@ -177,6 +181,10 @@ export function App() {
 	// Ref for stable access to batchedAppendEntries in SSE effect
 	const batchedAppendEntriesRef = useRef(batchedAppendEntries);
 	batchedAppendEntriesRef.current = batchedAppendEntries;
+
+	// Refs for mode-switch handlers used in keyboard handler (avoids re-registering on every state change)
+	const switchToArchiveRef = useRef(() => {});
+	const handleSwitchToLiveRef = useRef(() => {});
 
 	// SSE connection for session list (push-based, no polling)
 	// biome-ignore lint/correctness/useExhaustiveDependencies: visibilityReconnectTrigger intentionally triggers reconnect
@@ -575,26 +583,13 @@ export function App() {
 
 			switch (e.key.toLowerCase()) {
 				case 'h':
-					// Toggle between Live and Archive mode
+					// Toggle between Live and Archive mode (Row 34: with scroll anchor)
 					e.preventDefault();
-					setViewMode((prev) => {
-						if (prev === 'live') {
-							// Switching to Archive: capture snapshot atomically using refs
-							// This avoids race condition where entries arrive after snapshot but before reset
-							const snapshotEntries = entriesRef.current;
-							const snapshotHasMore = hasMoreRef.current;
-							const snapshotCursor = cursorRef.current;
-							setArchiveSnapshotTimestamp(new Date().toISOString());
-							setArchiveEntries([...snapshotEntries]);
-							setArchiveLoading(false);
-							setArchiveHasMore(snapshotHasMore);
-							// Copy the byte cursor for loading older entries in archive mode
-							setArchiveCursor(snapshotCursor !== null ? String(snapshotCursor) : null);
-							setNewEntriesSinceSnapshot(0);
-							return 'archive';
-						}
-						return 'live';
-					});
+					if (viewModeRef.current === 'live') {
+						switchToArchiveRef.current();
+					} else {
+						handleSwitchToLiveRef.current();
+					}
 					break;
 				case 't':
 					e.preventDefault();
@@ -665,26 +660,32 @@ export function App() {
 		[archiveMaxEntries],
 	);
 
-	// V3 Mode handlers
-	const handleViewFullHistory = useCallback(() => {
-		const { limitedEntries, totalCount, hitLimit } = applyMemoryLimit(entries);
+	// V3 Mode handlers - Live→Archive switch
+	const switchToArchive = useCallback(() => {
+		const sourceEntries = entriesRef.current;
+		const sourceHasMore = hasMoreRef.current;
+		const sourceCursor = cursorRef.current;
+		const { limitedEntries, totalCount, hitLimit } = applyMemoryLimit(sourceEntries);
 		setArchiveSnapshotTimestamp(new Date().toISOString());
 		setArchiveEntries([...limitedEntries]);
 		setArchiveTotalCount(totalCount);
 		setArchiveMemoryWarning(hitLimit);
 		setArchiveLoading(false);
-		setArchiveHasMore(hasMore && !hitLimit); // Row 33: No more loading if limit hit
-		// Copy the byte cursor for loading older entries in archive mode
-		setArchiveCursor(cursor !== null ? String(cursor) : null);
+		setArchiveHasMore(sourceHasMore && !hitLimit);
+		setArchiveCursor(sourceCursor !== null ? String(sourceCursor) : null);
 		setNewEntriesSinceSnapshot(0);
-		setArchiveFirstItemIndex(100000); // Row 13: Reset for fresh archive
+		setArchiveFirstItemIndex(100000);
 		setViewMode('archive');
-	}, [entries, hasMore, cursor, applyMemoryLimit]);
+	}, [applyMemoryLimit]);
 
 	const handleSwitchToLive = useCallback(() => {
 		setViewMode('live');
 		setArchiveMemoryWarning(false); // Reset warning when switching back to live
 	}, []);
+
+	// Keep keyboard handler refs in sync
+	switchToArchiveRef.current = switchToArchive;
+	handleSwitchToLiveRef.current = handleSwitchToLive;
 
 	const handleArchiveRefresh = useCallback(() => {
 		const { limitedEntries, totalCount, hitLimit } = applyMemoryLimit(entries);
@@ -764,27 +765,6 @@ export function App() {
 		setNewEntriesSinceSnapshot(0);
 	}, []);
 
-	const handleToggleViewMode = useCallback(() => {
-		setViewMode((prev) => {
-			if (prev === 'live') {
-				const { limitedEntries, totalCount, hitLimit } = applyMemoryLimit(entries);
-				setArchiveSnapshotTimestamp(new Date().toISOString());
-				setArchiveEntries([...limitedEntries]);
-				setArchiveTotalCount(totalCount);
-				setArchiveMemoryWarning(hitLimit);
-				setArchiveLoading(false);
-				setArchiveHasMore(hasMore && !hitLimit);
-				// Copy the byte cursor for loading older entries in archive mode
-				setArchiveCursor(cursor !== null ? String(cursor) : null);
-				setNewEntriesSinceSnapshot(0);
-				setArchiveFirstItemIndex(100000); // Row 13: Reset for fresh archive
-				return 'archive';
-			}
-			setArchiveMemoryWarning(false);
-			return 'live';
-		});
-	}, [entries, hasMore, cursor, applyMemoryLimit]);
-
 	if (loading) {
 		return (
 			<div className="app loading">
@@ -847,7 +827,7 @@ export function App() {
 									newEntriesCount={newEntriesSinceSnapshot}
 									jumpToBottomTrigger={jumpToBottomTrigger}
 									onJumpToBottom={handleJumpToBottom}
-									onViewFullHistory={handleViewFullHistory}
+									onViewFullHistory={switchToArchive}
 									expandThinking={expandThinking}
 									expandRead={expandRead}
 									expandEdit={expandEdit}

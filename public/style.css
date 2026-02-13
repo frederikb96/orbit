@@ -638,7 +638,25 @@ body {
 	font-family: var(--font-mono);
 	font-size: 0.7rem;
 	color: var(--text-muted);
-	margin-left: var(--space-sm);
+}
+
+/* Read tool result: flat single-box layout (no nested containers) */
+.read-result {
+	margin: var(--space-sm);
+	border-radius: var(--radius-sm);
+	overflow: hidden;
+}
+
+.read-result-header {
+	display: flex;
+	align-items: center;
+	gap: var(--space-sm);
+	padding: var(--space-xs) 0.75rem;
+	background: var(--surface-1);
+}
+
+.read-result .code-block {
+	border-radius: 0;
 }
 
 /* Timestamp inherits color from parent */
@@ -1529,6 +1547,7 @@ button:focus-visible {
 .code-block .code-content {
 	flex: 1;
 	overflow-x: auto;
+	overflow-y: hidden;
 	padding: 0.75rem;
 	margin: 0;
 }

@@ -663,26 +663,34 @@ const TranscriptReadResultOrGeneric = memo(function TranscriptReadResultOrGeneri
 		[isReadTool, result.content],
 	);
 
-	return (
-		<div className={`tool-result ${result.isError ? 'error' : ''}`}>
-			<div className="result-label">
-				{result.isError ? '\u274C Error' : '\u2713 Result'}
-				{stripped && !result.isError && (
+	if (isReadTool && filePath && !result.isError) {
+		return (
+			<div className="read-result">
+				<div className="read-result-header">
 					<span className="result-meta">
-						{stripped.lineCount} lines (from line {stripped.startLine})
+						{stripped ? `${stripped.lineCount} lines` : 'Result'}
+						{stripped && stripped.startLine > 1 && ` (from line ${stripped.startLine})`}
 					</span>
-				)}
-				<CopyButton content={result.content} title="Copy result" />
-			</div>
-			{isReadTool && filePath && !result.isError ? (
+					<CopyButton content={result.content} title="Copy result" />
+				</div>
 				<CodeBlock
 					code={stripped?.content ?? result.content}
 					filePath={filePath}
 					showLineNumbers={true}
 					startingLineNumber={stripped?.startLine ?? 1}
-					maxHeight="400px"
+					maxHeight="500px"
 				/>
-			) : isBashTool ? (
+			</div>
+		);
+	}
+
+	return (
+		<div className={`tool-result ${result.isError ? 'error' : ''}`}>
+			<div className="result-label">
+				{result.isError ? '\u274C Error' : '\u2713 Result'}
+				<CopyButton content={result.content} title="Copy result" />
+			</div>
+			{isBashTool ? (
 				<AnsiText text={result.content} className="result-content" />
 			) : (
 				<pre className="result-content">{result.content}</pre>

@@ -138,7 +138,11 @@ export function stripReadLineNumbers(content: string): {
 		return line;
 	});
 
-	// Remove trailing empty line if content ends with newline
+	// Trim trailing empty lines (dead space from file padding)
+	while (stripped.length > 1 && stripped[stripped.length - 1].trim() === '') {
+		stripped.pop();
+	}
+
 	const result = stripped.join('\n');
 	return { content: result, startLine, lineCount: stripped.length };
 }
