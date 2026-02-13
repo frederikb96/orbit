@@ -630,7 +630,15 @@ body {
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	max-width: 400px;
+	flex: 1;
+	min-width: 0;
+}
+
+.result-meta {
+	font-family: var(--font-mono);
+	font-size: 0.7rem;
+	color: var(--text-muted);
+	margin-left: var(--space-sm);
 }
 
 /* Timestamp inherits color from parent */

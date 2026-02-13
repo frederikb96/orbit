@@ -5,12 +5,19 @@
  * Uses @parcel/watcher events for incremental updates - no polling.
  */
 
-import { existsSync } from 'node:fs';
-import { basename } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 import type { OrbitConfig, Session, SessionType } from '../types.ts';
 import { getConfig } from './config.ts';
 import { getNewestNFiles } from './discovery.ts';
 import { type DirectoryWatcher, createWatcher } from './watcher.ts';
+
+function getSessionNamesPath(): string {
+	const xdgConfig = process.env.XDG_CONFIG_HOME;
+	const baseDir = xdgConfig || join(homedir(), '.config');
+	return join(baseDir, 'orbit', 'names.json');
+}
 
 // Session filename patterns - single source of truth
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -51,6 +58,7 @@ export class SessionManager {
 
 	constructor(config?: OrbitConfig) {
 		this.config = config ?? getConfig();
+		this.loadSessionNames();
 	}
 
 	/**
@@ -195,6 +203,7 @@ export class SessionManager {
 			return false;
 		}
 		this.sessionNames.set(id, name);
+		this.saveSessionNames();
 		this.scheduleNotify();
 		return true;
 	}
@@ -213,6 +222,36 @@ export class SessionManager {
 	onChange(listener: SessionChangeListener): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	private loadSessionNames(): void {
+		const path = getSessionNamesPath();
+		if (!existsSync(path)) return;
+		try {
+			const data = JSON.parse(readFileSync(path, 'utf-8'));
+			for (const [id, name] of Object.entries(data)) {
+				if (typeof name === 'string') {
+					this.sessionNames.set(id, name);
+				}
+			}
+		} catch {
+			// Corrupted file — start fresh
+		}
+	}
+
+	private saveSessionNames(): void {
+		const path = getSessionNamesPath();
+		const dir = dirname(path);
+		if (!existsSync(dir)) {
+			mkdirSync(dir, { recursive: true });
+		}
+		const data: Record<string, string> = {};
+		for (const [id, name] of this.sessionNames) {
+			data[id] = name;
+		}
+		const tmpPath = `${path}.tmp`;
+		writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+		renameSync(tmpPath, path);
 	}
 
 	/**

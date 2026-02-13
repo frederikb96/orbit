@@ -1,6 +1,10 @@
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { formatNumber, formatTime, formatToolInput } from '../../shared/formatters.ts';
-import { getLanguageFromPath } from '../../shared/languages.ts';
+import {
+	formatNumber,
+	formatTime,
+	formatToolInput,
+	stripReadLineNumbers,
+} from '../../shared/formatters.ts';
 import { getExpandGroup, getToolCategory } from '../../shared/tools.ts';
 import type { ParsedEntry, ParsedToolResult } from '../../types.ts';
 import { useConfig } from '../ConfigContext.tsx';
@@ -512,7 +516,11 @@ const ToolCallBlock = memo(function ToolCallBlock({
 					{icon} {tool.name.toUpperCase()}
 				</span>
 				<span className="timestamp">{formatTime(timestamp)}</span>
-				{isFileTool && filePath && <span className="tool-filepath">{filePath}</span>}
+				{isFileTool && filePath && (
+					<span className="tool-filepath" title={summary}>
+						{summary}
+					</span>
+				)}
 				{result && (
 					<span
 						className={`result-indicator ${result.isError ? 'error' : 'success'}`}
@@ -554,27 +562,63 @@ const ToolCallBlock = memo(function ToolCallBlock({
 				)}
 
 				{!hasDiff && !isWriteTool && result && (
-					<div className={`tool-result ${result.isError ? 'error' : ''}`}>
-						<div className="result-label">
-							{result.isError ? '\u274C Error' : '\u2713 Result'}
-							<CopyButton content={result.content} title="Copy result" />
-						</div>
-						{isReadTool && filePath && getLanguageFromPath(filePath) ? (
-							<CodeBlock
-								code={result.content}
-								filePath={filePath}
-								showLineNumbers={true}
-								maxHeight="400px"
-							/>
-						) : isBashTool ? (
-							<AnsiText text={result.content} className="result-content" />
-						) : (
-							<pre className="result-content">{result.content}</pre>
-						)}
-					</div>
+					<ReadResultOrGeneric
+						result={result}
+						isReadTool={isReadTool}
+						isBashTool={isBashTool}
+						filePath={filePath}
+					/>
 				)}
 			</div>
 		</details>
+	);
+});
+
+/**
+ * Renders Read tool results with stripped cat -n line numbers,
+ * or falls back to generic result display for other tools.
+ */
+const ReadResultOrGeneric = memo(function ReadResultOrGeneric({
+	result,
+	isReadTool,
+	isBashTool,
+	filePath,
+}: {
+	result: ParsedToolResult;
+	isReadTool: boolean;
+	isBashTool: boolean;
+	filePath?: string;
+}) {
+	const stripped = useMemo(
+		() => (isReadTool ? stripReadLineNumbers(result.content) : null),
+		[isReadTool, result.content],
+	);
+
+	return (
+		<div className={`tool-result ${result.isError ? 'error' : ''}`}>
+			<div className="result-label">
+				{result.isError ? '\u274C Error' : '\u2713 Result'}
+				{stripped && !result.isError && (
+					<span className="result-meta">
+						{stripped.lineCount} lines (from line {stripped.startLine})
+					</span>
+				)}
+				<CopyButton content={result.content} title="Copy result" />
+			</div>
+			{isReadTool && filePath && !result.isError ? (
+				<CodeBlock
+					code={stripped?.content ?? result.content}
+					filePath={filePath}
+					showLineNumbers={true}
+					startingLineNumber={stripped?.startLine ?? 1}
+					maxHeight="400px"
+				/>
+			) : isBashTool ? (
+				<AnsiText text={result.content} className="result-content" />
+			) : (
+				<pre className="result-content">{result.content}</pre>
+			)}
+		</div>
 	);
 });
 

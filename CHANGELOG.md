@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - EntryContext for shared entry state (eliminates prop drilling, improves memoization)
 - Windowed data loading: Initial load shows last 50 entries, scroll to top loads more (instant first paint)
 - Session navigation shortcuts: Shift+Alt+PageUp/PageDown (or Shift+Alt+,/.) to move between sessions
-- Session names REST endpoint (`POST /api/sessions/:id/name`) for custom session display names
+- Session names REST endpoint (`POST /api/sessions/:id/name`) with JSON file persistence (`~/.config/orbit/names.json`)
+- Read tool results show line count and starting line number metadata
 - Tool category system with 9 categories (read/edit/bash/search/web/task/mcp/skill/other)
 - Tool category colors and icons for visual identification
 - Markdown rendering for user and assistant messages (GFM support, XSS sanitization)
@@ -48,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SSE streams dropping silently when browser tab backgrounded (visibility-based reconnect)
 - Bun idle timeout too aggressive for long-lived SSE connections (30s → 255s max)
 - Race condition in SSE handler when client disconnects during async watcher setup
+- Read tool display: stripped duplicate `cat -n` line numbers, proper CodeBlock rendering for all Read results
+- Tool description truncation now responsive (fills available width, only truncates when window is narrow)
+- Tool filepath shows full summary on hover via `title` attribute
+- Session names now persist across daemon restarts via JSON file
 
 - Visual refresh: GitHub-inspired dark theme with semantic palette (3 colors: accent, success, error)
 - Removed tool category colors in favor of monochrome styling (cleaner visual hierarchy)

@@ -53,8 +53,19 @@ export function formatToolInput(
 
 	// Read tool
 	if (name === 'Read') {
+		const parts: string[] = [];
+		const offset = input.offset as number | undefined;
+		const limit = input.limit as number | undefined;
+		if (offset && limit) {
+			parts.push(`lines ${offset}-${offset + limit}`);
+		} else if (offset) {
+			parts.push(`from line ${offset}`);
+		} else if (limit) {
+			parts.push(`${limit} lines`);
+		}
+		const meta = parts.length > 0 ? ` (${parts.join(', ')})` : '';
 		return {
-			summary: String(input.file_path || 'unknown'),
+			summary: `${input.file_path || 'unknown'}${meta}`,
 			details: '',
 		};
 	}
@@ -97,4 +108,37 @@ export function formatToolInput(
 		summary: summary || '(empty)',
 		details: JSON.stringify(input, null, 2),
 	};
+}
+
+/**
+ * Strip `cat -n` line number prefixes from Read tool output.
+ * Claude Code Read tool returns content as "  1→content\n  2→content\n..."
+ * Returns cleaned content and the starting line number.
+ */
+export function stripReadLineNumbers(content: string): {
+	content: string;
+	startLine: number;
+	lineCount: number;
+} {
+	const lines = content.split('\n');
+	// Check if first non-empty line matches cat -n format: spaces + digits + → or tab
+	const catNPattern = /^\s*(\d+)[→\t]/;
+	const firstLine = lines.find((l) => l.trim().length > 0);
+	if (!firstLine || !catNPattern.test(firstLine)) {
+		return { content, startLine: 1, lineCount: lines.length };
+	}
+
+	let startLine = 1;
+	const stripped = lines.map((line, i) => {
+		const match = line.match(catNPattern);
+		if (match) {
+			if (i === 0) startLine = Number.parseInt(match[1], 10);
+			return line.replace(catNPattern, '');
+		}
+		return line;
+	});
+
+	// Remove trailing empty line if content ends with newline
+	const result = stripped.join('\n');
+	return { content: result, startLine, lineCount: stripped.length };
 }
