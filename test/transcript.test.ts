@@ -344,4 +344,88 @@ describe('parseTranscriptTail', () => {
 			expect(second.entries.length).toBeGreaterThan(0);
 		}
 	});
+
+	test('skips trailing progress/noise lines and returns real entries', async () => {
+		const noiseFile = join(TEST_DIR, 'noise-tail-test.jsonl');
+		const lines = [
+			JSON.stringify({ type: 'user', userType: 'external', message: { content: 'Msg 1' } }),
+			JSON.stringify({
+				type: 'assistant',
+				message: { content: [{ type: 'text', text: 'Reply 1' }] },
+			}),
+			JSON.stringify({ type: 'user', userType: 'external', message: { content: 'Msg 2' } }),
+			// Trailing noise that parseEntry doesn't handle
+			...Array.from({ length: 100 }, (_, i) =>
+				JSON.stringify({
+					type: 'progress',
+					userType: 'external',
+					message: { content: `progress ${i}` },
+				}),
+			),
+			JSON.stringify({ type: 'queue-operation', data: {} }),
+			JSON.stringify({ type: 'file-history-snapshot', data: {} }),
+		];
+		writeFileSync(noiseFile, `${lines.join('\n')}\n`);
+
+		try {
+			const result = await parseTranscriptTail(noiseFile, 50);
+			expect(result.entries.length).toBe(3);
+			expect(result.entries[0].content).toBe('Msg 1');
+			expect(result.entries[2].content).toBe('Msg 2');
+			expect(result.hasMore).toBe(false);
+		} finally {
+			rmSync(noiseFile);
+		}
+	});
+
+	test('returns empty for file with only noise lines', async () => {
+		const noiseOnlyFile = join(TEST_DIR, 'noise-only-test.jsonl');
+		const lines = Array.from({ length: 50 }, (_, i) =>
+			JSON.stringify({
+				type: 'progress',
+				userType: 'external',
+				message: { content: `progress ${i}` },
+			}),
+		);
+		writeFileSync(noiseOnlyFile, `${lines.join('\n')}\n`);
+
+		try {
+			const result = await parseTranscriptTail(noiseOnlyFile, 50);
+			expect(result.entries).toHaveLength(0);
+			expect(result.hasMore).toBe(false);
+		} finally {
+			rmSync(noiseOnlyFile);
+		}
+	});
+
+	test('pagination works correctly with interleaved noise', async () => {
+		const mixedFile = join(TEST_DIR, 'mixed-noise-test.jsonl');
+		const lines: string[] = [];
+		for (let i = 0; i < 10; i++) {
+			lines.push(
+				JSON.stringify({ type: 'user', userType: 'external', message: { content: `Msg ${i}` } }),
+			);
+			// Interleave noise between real entries
+			for (let j = 0; j < 5; j++) {
+				lines.push(JSON.stringify({ type: 'progress', message: { content: `p${i}-${j}` } }));
+			}
+		}
+		writeFileSync(mixedFile, `${lines.join('\n')}\n`);
+
+		try {
+			const first = await parseTranscriptTail(mixedFile, 3);
+			expect(first.entries).toHaveLength(3);
+			expect(first.entries[0].content).toBe('Msg 7');
+			expect(first.entries[2].content).toBe('Msg 9');
+			expect(first.hasMore).toBe(true);
+
+			const second = await parseTranscriptTail(mixedFile, 3, first.cursor);
+			expect(second.entries).toHaveLength(3);
+			expect(second.entries[0].content).toBe('Msg 4');
+			expect(second.entries[2].content).toBe('Msg 6');
+			expect(second.hasMore).toBe(true);
+		} finally {
+			rmSync(mixedFile);
+		}
+	});
 });

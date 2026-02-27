@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Remote session selection API (`POST /api/select-session/:id`) with SSE broadcast
+- URL param session selection (`?session=<id>`) for direct linking
+- `orbit start --foreground` flag for running under process managers (systemd, etc.)
+- systemd-aware CLI: `orbit stop` redirects to systemctl when managed by systemd, `orbit status` shows management mode, `orbit logs` auto-selects correct journal source
+- Graceful SIGTERM/SIGINT shutdown in foreground mode (clean SSE disconnect, PID cleanup)
+
+### Fixed
+
+- Sessions with many trailing progress/queue-operation lines showing "Waiting for new entries" instead of actual content — `parseTranscriptTail` now filters non-renderable entry types before applying the window limit
+- `bun test` picking up tests from orbit-refs — added `bunfig.toml` with test root
+- Session opening now starts at bottom instantly — removed CSS `scroll-behavior: smooth` (was animating all programmatic scrolls) and use `useLayoutEffect` for pre-paint scroll positioning
+- Subagent discovery broken for new Claude Code agent ID formats (15, 17, 25 hex chars) — regex only accepted 7-8 chars
+- Session list sidebar not updating — equality check only compared session IDs, ignoring mtime/name changes
+- Subagents in newly created session directories invisible to watcher — @parcel/watcher misses nested dirs from recursive mkdir, now scans on directory creation + re-subscribes
+- SSE reconnection resilience when Chrome window behind other apps — focus event + stale detection + infinite retries
+
+### Added
+
+- Home/End/PageUp/PageDown keyboard navigation in transcript views (Live and Archive)
 - SSE reconnection with exponential backoff and retry info indicator (configurable via `sseMaxRetries`, `sseBaseDelayMs`, `sseMaxDelayMs`)
 - Archive memory limit protection with configurable `archiveMaxEntries` (default 10,000)
 - Memory warning banner when archive loading is truncated due to limit
