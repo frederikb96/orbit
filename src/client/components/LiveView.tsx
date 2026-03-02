@@ -17,11 +17,13 @@ import { getExpandGroup, getToolCategory } from '../../shared/tools.ts';
 import type { ParsedEntry, ParsedToolResult } from '../../types.ts';
 import { useConfig } from '../ConfigContext.tsx';
 import { EntryProvider, type ExpandState, useEntryContext } from '../EntryContext.tsx';
+import { useTranscriptSearch } from '../hooks/useTranscriptSearch.ts';
 import { AnsiText } from './AnsiText.tsx';
 import { CodeBlock } from './CodeBlock.tsx';
 import { CopyButton } from './CopyButton.tsx';
 import { LazyDiffView } from './LazyDiffView.tsx';
 import { Markdown } from './Markdown.tsx';
+import { SearchOverlay } from './SearchOverlay.tsx';
 
 // Auto-scroll threshold: consider "at bottom" if within 50px
 const AT_BOTTOM_THRESHOLD = 50;
@@ -142,6 +144,33 @@ export function LiveView({
 		(toolUseId: string): ParsedToolResult | undefined => toolResultMap.get(toolUseId),
 		[toolResultMap],
 	);
+
+	// Transcript search
+	const search = useTranscriptSearch(displayEntries, getToolResult);
+
+	// Ctrl+F interception
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+				e.preventDefault();
+				search.open();
+			}
+		};
+		window.addEventListener('keydown', handleKeyDown);
+		return () => window.removeEventListener('keydown', handleKeyDown);
+	}, [search.open]);
+
+	// Scroll to match on navigation (uses DOM scrollIntoView for non-virtualized list)
+	useEffect(() => {
+		if (search.navigateCounter > 0 && search.currentEntryIndex !== null && containerRef.current) {
+			const entryEl = containerRef.current.querySelector(
+				`[data-entry-idx="${search.currentEntryIndex}"]`,
+			);
+			if (entryEl) {
+				entryEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+			}
+		}
+	}, [search.navigateCounter, search.currentEntryIndex]);
 
 	// Handle scroll events - detect position and manage debounced indicators
 	const handleScroll = useCallback(() => {
@@ -280,14 +309,14 @@ export function LiveView({
 					e.preventDefault();
 					container.scrollTo({
 						top: container.scrollTop - container.clientHeight,
-						behavior: 'smooth',
+						behavior: 'auto',
 					});
 					break;
 				case 'PageDown':
 					e.preventDefault();
 					container.scrollTo({
 						top: container.scrollTop + container.clientHeight,
-						behavior: 'smooth',
+						behavior: 'auto',
 					});
 					break;
 			}
@@ -378,6 +407,19 @@ export function LiveView({
 				</button>
 			</header>
 
+			{search.isOpen && (
+				<SearchOverlay
+					query={search.query}
+					onQueryChange={search.setQuery}
+					matchCount={search.matches.length}
+					currentMatch={search.currentMatchIdx}
+					onNext={search.nextMatch}
+					onPrev={search.prevMatch}
+					onClose={search.close}
+					inputRef={search.inputRef}
+				/>
+			)}
+
 			{/* Scroll container - outer */}
 			<div ref={containerRef} className="live-view-container" onScroll={handleScroll}>
 				{/* Normal column container - inner */}
@@ -389,11 +431,20 @@ export function LiveView({
 						</div>
 					) : (
 						<EntryProvider expandState={expandState} getToolResult={getToolResult}>
-							{displayEntries.map((entry) => (
-								<div key={entry.id} data-entry-id={entry.id}>
-									<LiveEntryCard entry={entry} />
-								</div>
-							))}
+							{displayEntries.map((entry, idx) => {
+								const isMatch = search.isOpen && search.matchSet.has(idx);
+								const isCurrent = isMatch && search.currentEntryIndex === idx;
+								return (
+									<div
+										key={entry.id}
+										data-entry-id={entry.id}
+										data-entry-idx={idx}
+										className={`${isMatch ? 'search-match' : ''} ${isCurrent ? 'search-match-current' : ''}`}
+									>
+										<LiveEntryCard entry={entry} />
+									</div>
+								);
+							})}
 						</EntryProvider>
 					)}
 				</div>

@@ -70,8 +70,9 @@ export class OrbitServer {
 			? Number.parseInt(process.env.ORBIT_PORT, 10)
 			: this.config.server.port;
 
+		const hostname = process.env.ORBIT_HOST || 'localhost';
 		this.server = Bun.serve({
-			hostname: 'localhost',
+			hostname,
 			port,
 			idleTimeout: 255,
 			fetch: async (req) => {
@@ -94,7 +95,7 @@ export class OrbitServer {
 		});
 
 		writePid(process.pid);
-		console.log(`Orbit server running at http://localhost:${port}`);
+		console.log(`Orbit server running at http://${hostname}:${port}`);
 	}
 
 	/**
@@ -144,6 +145,15 @@ export class OrbitServer {
 			const sessions = this.sessionManager.getSessions();
 			const clientSessions = sessions.map(({ path: _path, ...rest }) => rest);
 			return Response.json(clientSessions);
+		}
+
+		// GET /api/sessions/search - Fuzzy search across ALL sessions on disk
+		if (path === '/api/sessions/search' && req.method === 'GET') {
+			const query = url.searchParams.get('q') || '';
+			const limitParam = url.searchParams.get('limit');
+			const limit = limitParam ? Math.min(Math.max(1, Number.parseInt(limitParam, 10)), 50) : 20;
+			const results = this.sessionManager.searchSessions(query, limit);
+			return Response.json({ results });
 		}
 
 		// GET /api/sessions/stream - SSE stream for session list updates
@@ -268,6 +278,11 @@ export class OrbitServer {
 
 			if (!isValidSessionId(id)) {
 				return Response.json({ error: 'Invalid session ID' }, { status: 400 });
+			}
+
+			// Activate untracked sessions so they appear in the sidebar
+			if (!this.sessionManager.getSession(id)) {
+				this.sessionManager.activateSession(id);
 			}
 
 			this.broadcastSelectSession(id);

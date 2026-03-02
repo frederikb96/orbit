@@ -19,7 +19,8 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { OrbitConfig, Session, SessionType } from '../types.ts';
 import { getConfig } from './config.ts';
-import { getNewestNFiles } from './discovery.ts';
+import { getAllFilesWithMtime, getNewestNFiles } from './discovery.ts';
+import { type SearchResult, scoreSession } from './search.ts';
 import { type DirectoryWatcher, createWatcher } from './watcher.ts';
 
 function getSessionNamesPath(): string {
@@ -315,6 +316,82 @@ export class SessionManager {
 	 */
 	getSessionName(id: string): string | undefined {
 		return this.sessionNames.get(id);
+	}
+
+	/**
+	 * Activate an untracked session by ID.
+	 * Scans watchPath for the session file and adds it to the tracked set.
+	 * Returns the session if found, null otherwise.
+	 */
+	activateSession(id: string): Session | null {
+		if (this.sessions.has(id)) {
+			const existing = this.sessions.get(id)!;
+			const name = this.sessionNames.get(id);
+			return name ? { ...existing, name } : existing;
+		}
+
+		const files = getAllFilesWithMtime(this.config.sessions.watchPath, {
+			extension: '.jsonl',
+			matchFilename: (filename) => {
+				const nameWithoutExt = filename.replace(/\.jsonl$/, '');
+				if (UUID_PATTERN.test(nameWithoutExt)) return nameWithoutExt === id;
+				const match = nameWithoutExt.match(AGENT_PATTERN);
+				return match ? match[1] === id : false;
+			},
+		});
+
+		if (files.length === 0) return null;
+
+		const session = this.fileToSession(files[0].path, files[0].mtimeMs);
+		if (!session) return null;
+
+		this.sessions.delete(session.id);
+		this.sessions.set(session.id, session);
+		this.trimSessions();
+		this.scheduleNotify();
+
+		const name = this.sessionNames.get(session.id);
+		return name ? { ...session, name } : session;
+	}
+
+	/**
+	 * Search all sessions on disk by fuzzy matching against ID and name.
+	 * Only returns main sessions (not agents) by default.
+	 */
+	searchSessions(query: string, limit = 20): SearchResult[] {
+		if (!query.trim()) return [];
+
+		const files = getAllFilesWithMtime(this.config.sessions.watchPath, {
+			extension: '.jsonl',
+			matchFilename: (filename) => {
+				const nameWithoutExt = filename.replace(/\.jsonl$/, '');
+				return UUID_PATTERN.test(nameWithoutExt);
+			},
+		});
+
+		const scored: { result: SearchResult; score: number }[] = [];
+
+		for (const file of files) {
+			const filename = basename(file.path);
+			const nameWithoutExt = filename.replace(/\.jsonl$/, '');
+			const sessionName = this.sessionNames.get(nameWithoutExt);
+			const score = scoreSession(query, nameWithoutExt, sessionName);
+
+			if (score > 0) {
+				scored.push({
+					result: {
+						id: nameWithoutExt,
+						name: sessionName,
+						mtime: file.mtimeMs,
+						type: 'session',
+					},
+					score,
+				});
+			}
+		}
+
+		scored.sort((a, b) => b.score - a.score);
+		return scored.slice(0, limit).map((s) => s.result);
 	}
 
 	/**

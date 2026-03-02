@@ -104,6 +104,7 @@ export function App() {
 	const [archiveTotalCount, setArchiveTotalCount] = useState<number>(0); // Row 32: Total entries for progress
 	const [archiveMemoryWarning, setArchiveMemoryWarning] = useState(false); // Row 33: Memory limit hit
 	const [archiveFirstItemIndex, setArchiveFirstItemIndex] = useState(100000); // Row 13: Virtual index offset for prepended content
+	const [isLoadingAll, setIsLoadingAll] = useState(false);
 
 	// MRU (Most Recently Used) stack: ordered list of session IDs, index 0 = most recent
 	const [mruStack, setMruStack] = useState<string[]>([]);
@@ -771,6 +772,53 @@ export function App() {
 		}
 	}, [archiveEntries.length, archiveMaxEntries, archiveCursor, selectedSession, archiveLoading]);
 
+	// Load all remaining archive entries (triggered by search Ctrl+F)
+	const handleLoadAllArchive = useCallback(async () => {
+		if (!selectedSession || !archiveHasMore || isLoadingAll) return;
+
+		setIsLoadingAll(true);
+		let localCursor = archiveCursor;
+		const batches: ParsedEntry[][] = [];
+
+		try {
+			while (localCursor) {
+				const byteCursor = Number.parseInt(localCursor, 10);
+				const response = await fetch(
+					`/api/sessions/${selectedSession.id}/entries?before=${byteCursor}&limit=500`,
+				);
+				if (!response.ok) break;
+
+				const data = await response.json();
+				const older = data.entries as ParsedEntry[];
+				if (older.length === 0) break;
+
+				batches.push(older);
+				localCursor = data.hasMore ? String(data.cursor) : null;
+			}
+
+			if (batches.length > 0) {
+				const allOlder = batches.reverse().flat();
+				const displayCount = allOlder.filter((e) => e.type !== 'tool_result').length;
+
+				setArchiveFirstItemIndex((prev) => prev - displayCount);
+				setArchiveEntries((prev) => {
+					const combined = [...allOlder, ...prev];
+					if (combined.length > archiveMaxEntries) {
+						setArchiveMemoryWarning(true);
+						return combined.slice(-archiveMaxEntries);
+					}
+					return combined;
+				});
+				setArchiveTotalCount((prev) => prev + allOlder.length);
+			}
+
+			setArchiveHasMore(false);
+			setArchiveCursor(null);
+		} finally {
+			setIsLoadingAll(false);
+		}
+	}, [selectedSession, archiveHasMore, archiveCursor, archiveMaxEntries, isLoadingAll]);
+
 	const handleJumpToBottom = useCallback(() => {
 		// Reset new entries counter when jumping to bottom
 		setNewEntriesSinceSnapshot(0);
@@ -872,6 +920,8 @@ export function App() {
 									onToggleExpandRead={handleToggleExpandRead}
 									onToggleExpandEdit={handleToggleExpandEdit}
 									onToggleExpandOther={handleToggleExpandOther}
+									isLoadingAll={isLoadingAll}
+									onLoadAll={handleLoadAllArchive}
 								/>
 							)
 						) : (

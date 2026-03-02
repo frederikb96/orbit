@@ -10,11 +10,13 @@ import { getExpandGroup, getToolCategory } from '../../shared/tools.ts';
 import type { ParsedEntry, ParsedToolResult, Session, TokenStats } from '../../types.ts';
 import { useConfig } from '../ConfigContext.tsx';
 import { EntryProvider, type ExpandState, useEntryContext } from '../EntryContext.tsx';
+import { useTranscriptSearch } from '../hooks/useTranscriptSearch.ts';
 import { AnsiText } from './AnsiText.tsx';
 import { CodeBlock } from './CodeBlock.tsx';
 import { CopyButton } from './CopyButton.tsx';
 import { LazyDiffView } from './LazyDiffView.tsx';
 import { Markdown } from './Markdown.tsx';
+import { SearchOverlay } from './SearchOverlay.tsx';
 
 // Threshold for showing "Back to Live" floating indicator
 const NEAR_BOTTOM_THRESHOLD = 500;
@@ -53,6 +55,8 @@ export interface ArchiveViewProps {
 	onToggleExpandRead: () => void;
 	onToggleExpandEdit: () => void;
 	onToggleExpandOther: () => void;
+	isLoadingAll?: boolean;
+	onLoadAll?: () => void;
 }
 
 export function ArchiveView({
@@ -79,6 +83,8 @@ export function ArchiveView({
 	onToggleExpandRead,
 	onToggleExpandEdit,
 	onToggleExpandOther,
+	isLoadingAll = false,
+	onLoadAll,
 }: ArchiveViewProps) {
 	const { config } = useConfig();
 	const virtuosoRef = useRef<VirtuosoHandle>(null);
@@ -154,19 +160,53 @@ export function ArchiveView({
 		[],
 	);
 
-	// Scroll to end on initial load (Row 13: use virtual index)
+	// Transcript search
+	const search = useTranscriptSearch(displayEntries, getToolResult);
+
+	// Sync external loading state into search hook
 	useEffect(() => {
-		if (!isInitialScrollDone.current && displayEntries.length > 0 && virtuosoRef.current) {
+		search.setIsLoadingAll(isLoadingAll);
+	}, [isLoadingAll, search.setIsLoadingAll]);
+
+	// Ctrl+F interception
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+				e.preventDefault();
+				search.open();
+				if (hasMore && onLoadAll) onLoadAll();
+			}
+		};
+		window.addEventListener('keydown', handleKeyDown);
+		return () => window.removeEventListener('keydown', handleKeyDown);
+	}, [search.open, hasMore, onLoadAll]);
+
+	// Scroll to match on navigation via native scroll (Virtuoso's scrollToIndex
+	// doesn't work reliably with large firstItemIndex values)
+	useEffect(() => {
+		if (search.navigateCounter > 0 && search.currentEntryIndex !== null && scrollerElRef.current) {
+			const el = scrollerElRef.current;
+			const fraction = search.currentEntryIndex / displayEntries.length;
+			const targetTop = fraction * (el.scrollHeight - el.clientHeight);
+			el.scrollTo({ top: targetTop, behavior: 'auto' });
+		}
+	}, [search.navigateCounter, search.currentEntryIndex, displayEntries.length]);
+
+	// Disable progressive loading while loadAll is running
+	const effectiveIsLoading = isLoading || isLoadingAll;
+
+	// Scroll to end on initial load
+	useEffect(() => {
+		if (!isInitialScrollDone.current && displayEntries.length > 0 && scrollerElRef.current) {
 			isInitialScrollDone.current = true;
 			setTimeout(() => {
-				virtuosoRef.current?.scrollToIndex({
-					index: firstItemIndex + displayEntries.length - 1,
-					align: 'end',
+				scrollerElRef.current?.scrollTo({
+					top: scrollerElRef.current.scrollHeight,
 					behavior: 'auto',
 				});
 			}, 50);
 		}
-	}, [displayEntries.length, firstItemIndex]);
+	}, [displayEntries.length]);
 
 	// Reset initial scroll flag on session change
 	// biome-ignore lint/correctness/useExhaustiveDependencies: session.id intentionally triggers reset
@@ -184,16 +224,14 @@ export function ArchiveView({
 		if (!pendingAnchorRestore.current || !anchorEntryId || displayEntries.length === 0) return;
 
 		const anchorIndex = displayEntries.findIndex((e) => e.id === anchorEntryId);
-		if (anchorIndex >= 0) {
-			virtuosoRef.current?.scrollToIndex({
-				index: firstItemIndex + anchorIndex,
-				align: 'start',
-				behavior: 'auto',
-			});
+		if (anchorIndex >= 0 && scrollerElRef.current) {
+			const fraction = anchorIndex / displayEntries.length;
+			const el = scrollerElRef.current;
+			el.scrollTo({ top: fraction * (el.scrollHeight - el.clientHeight), behavior: 'auto' });
 		}
 		pendingAnchorRestore.current = false;
 		setAnchorEntryId(null);
-	}, [displayEntries, anchorEntryId, firstItemIndex]);
+	}, [displayEntries, anchorEntryId]);
 
 	// Capture anchor before refresh and trigger onRefresh
 	// Row 13: visibleStartIndexRef is a virtual index, convert to array index
@@ -231,29 +269,27 @@ export function ArchiveView({
 
 	// Progressive loading: load more when at bottom and has more
 	useEffect(() => {
-		if (hasMore && !isPaused && !isLoading) {
+		if (hasMore && !isPaused && !effectiveIsLoading) {
 			onLoadMore();
 		}
-	}, [hasMore, isPaused, isLoading, onLoadMore]);
+	}, [hasMore, isPaused, effectiveIsLoading, onLoadMore]);
 
 	// Snap to bottom after progressive loading adds content (Row 13: use virtual index)
+	// Suppressed when search is open to prevent overriding search scroll navigation
 	useEffect(() => {
 		const currentLength = displayEntries.length;
 		const hadNewEntries = currentLength > prevEntriesLength.current;
 		prevEntriesLength.current = currentLength;
 
-		// Only snap to bottom if user is CURRENTLY at bottom (not where they were when loading started)
-		if (hadNewEntries && isAtBottomRef.current && currentLength > 0) {
-			// Small delay to let Virtuoso measure the new content
+		if (hadNewEntries && isAtBottomRef.current && currentLength > 0 && !search.isOpen) {
 			setTimeout(() => {
-				virtuosoRef.current?.scrollToIndex({
-					index: firstItemIndex + currentLength - 1,
-					align: 'end',
+				scrollerElRef.current?.scrollTo({
+					top: scrollerElRef.current.scrollHeight,
 					behavior: 'auto',
 				});
 			}, 50);
 		}
-	}, [displayEntries.length, firstItemIndex]);
+	}, [displayEntries.length, search.isOpen]);
 
 	// Keyboard navigation: Home/End/PageUp/PageDown for transcript scrolling
 	useEffect(() => {
@@ -264,26 +300,25 @@ export function ArchiveView({
 			switch (e.key) {
 				case 'Home':
 					e.preventDefault();
-					virtuosoRef.current?.scrollToIndex({
-						index: firstItemIndex,
-						align: 'start',
-						behavior: 'auto',
-					});
+					if (scrollerElRef.current) {
+						scrollerElRef.current.scrollTo({ top: 0, behavior: 'auto' });
+					}
 					break;
 				case 'End':
 					e.preventDefault();
-					virtuosoRef.current?.scrollToIndex({
-						index: firstItemIndex + displayEntries.length - 1,
-						align: 'end',
-						behavior: 'auto',
-					});
+					if (scrollerElRef.current) {
+						scrollerElRef.current.scrollTo({
+							top: scrollerElRef.current.scrollHeight,
+							behavior: 'auto',
+						});
+					}
 					break;
 				case 'PageUp':
 					e.preventDefault();
 					if (scrollerElRef.current) {
 						scrollerElRef.current.scrollTo({
 							top: scrollerElRef.current.scrollTop - scrollerElRef.current.clientHeight,
-							behavior: 'smooth',
+							behavior: 'auto',
 						});
 					}
 					break;
@@ -292,7 +327,7 @@ export function ArchiveView({
 					if (scrollerElRef.current) {
 						scrollerElRef.current.scrollTo({
 							top: scrollerElRef.current.scrollTop + scrollerElRef.current.clientHeight,
-							behavior: 'smooth',
+							behavior: 'auto',
 						});
 					}
 					break;
@@ -301,16 +336,15 @@ export function ArchiveView({
 
 		window.addEventListener('keydown', handleKeyDown);
 		return () => window.removeEventListener('keydown', handleKeyDown);
-	}, [firstItemIndex, displayEntries.length]);
+	}, []);
 
-	// Scroll to bottom within Archive (for new entries badge) (Row 13: use virtual index)
+	// Scroll to bottom within Archive (for new entries badge)
 	const handleScrollToBottom = useCallback(() => {
-		virtuosoRef.current?.scrollToIndex({
-			index: firstItemIndex + displayEntries.length - 1,
-			align: 'end',
+		scrollerElRef.current?.scrollTo({
+			top: scrollerElRef.current.scrollHeight,
 			behavior: 'smooth',
 		});
-	}, [displayEntries.length, firstItemIndex]);
+	}, []);
 
 	// Compute stable key from entry ID (Row 13: account for firstItemIndex offset)
 	const computeItemKey = useCallback(
@@ -324,11 +358,20 @@ export function ArchiveView({
 	// Render function for Virtuoso (Row 13: account for firstItemIndex offset)
 	const itemContent = useCallback(
 		(index: number) => {
-			const entry = displayEntries[index - firstItemIndex];
+			const arrayIdx = index - firstItemIndex;
+			const entry = displayEntries[arrayIdx];
 			if (!entry) return <div style={{ height: '1px' }} />;
-			return <MemoizedEntryCard entry={entry} entriesCount={displayEntries.length} />;
+			const isMatch = search.isOpen && search.matchSet.has(arrayIdx);
+			const isCurrent = isMatch && search.currentEntryIndex === arrayIdx;
+			return (
+				<div
+					className={`${isMatch ? 'search-match' : ''} ${isCurrent ? 'search-match-current' : ''}`}
+				>
+					<MemoizedEntryCard entry={entry} entriesCount={displayEntries.length} />
+				</div>
+			);
 		},
-		[displayEntries, firstItemIndex],
+		[displayEntries, firstItemIndex, search.isOpen, search.matchSet, search.currentEntryIndex],
 	);
 
 	return (
@@ -406,6 +449,20 @@ export function ArchiveView({
 					&#x26A1;
 				</button>
 			</header>
+
+			{search.isOpen && (
+				<SearchOverlay
+					query={search.query}
+					onQueryChange={search.setQuery}
+					matchCount={search.matches.length}
+					currentMatch={search.currentMatchIdx}
+					onNext={search.nextMatch}
+					onPrev={search.prevMatch}
+					onClose={search.close}
+					inputRef={search.inputRef}
+					isLoadingAll={search.isLoadingAll}
+				/>
+			)}
 
 			{/* Row 33: Memory warning banner */}
 			{memoryWarning && (

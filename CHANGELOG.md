@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Session search:** Fuzzy search across ALL sessions on disk (not just tracked) by name and UUID via sidebar search bar (Ctrl+K to focus)
+- **Search endpoint:** `GET /api/sessions/search?q=<query>` for full-disk session discovery with fuzzy scoring
+- **On-demand session activation:** `select-session` API now activates untracked sessions automatically, making Kitty shortcut (Shift+Alt+K) work for any historical session
+- **In-transcript search:** Ctrl+F opens floating search overlay in both Live and Archive views — searches entry content, thinking blocks, tool calls, and tool results with match navigation (Enter/Shift+Enter) and entry-level highlighting
+- **Full transcript load on search:** Archive view automatically loads all remaining entries when search opens, enabling complete transcript search
+
 ## [0.2.0] - 2026-03-02
 
 ### Added
