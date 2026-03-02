@@ -199,7 +199,7 @@ function SessionItem({
 			className={classNames}
 			onClick={() => onSelect(session)}
 			onKeyDown={handleKeyDown}
-			title={title ? `${title} (${session.id})` : session.id}
+			title={session.name ? `${session.name} (${session.id})` : session.id}
 		>
 			<span className="session-type">{typeIcon}</span>
 			<span className="session-id">{displayName}</span>

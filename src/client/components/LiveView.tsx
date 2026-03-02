@@ -1,4 +1,12 @@
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+	memo,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from 'react';
 import {
 	formatNumber,
 	formatTime,
@@ -19,7 +27,7 @@ import { Markdown } from './Markdown.tsx';
 const AT_BOTTOM_THRESHOLD = 50;
 
 // Top detection threshold for "View Full History" indicator
-const AT_TOP_THRESHOLD = 100;
+const AT_TOP_THRESHOLD = 500;
 
 // Debounce delay for showing indicators (prevents flickering at thresholds)
 const INDICATOR_DEBOUNCE_MS = 400;
@@ -85,6 +93,9 @@ export function LiveView({
 
 	// Ref to track autoscroll state (survives re-renders, used in effects)
 	const autoscrollEnabledRef = useRef(true);
+
+	// Track initial load per session (instant scroll vs smooth for appends)
+	const isInitialLoadRef = useRef(true);
 
 	// Debounced indicator visibility (prevents flickering at thresholds)
 	const [showBanner, setShowBanner] = useState(false);
@@ -176,10 +187,16 @@ export function LiveView({
 	}, []);
 
 	// Auto-scroll when entries change AND autoscroll is enabled
-	// biome-ignore lint/correctness/useExhaustiveDependencies: entries.length intentionally triggers auto-scroll
-	useEffect(() => {
-		if (autoscrollEnabledRef.current && containerRef.current) {
+	// Initial load: useLayoutEffect with instant scroll (before paint, no visible jump)
+	// Subsequent appends: smooth scroll for nice UX
+	useLayoutEffect(() => {
+		if (!autoscrollEnabledRef.current || !containerRef.current) return;
+
+		if (isInitialLoadRef.current && entries.length > 0) {
 			containerRef.current.scrollTop = containerRef.current.scrollHeight;
+			isInitialLoadRef.current = false;
+		} else if (!isInitialLoadRef.current) {
+			containerRef.current.scrollTo({ top: containerRef.current.scrollHeight, behavior: 'smooth' });
 		}
 	}, [entries.length]);
 
@@ -196,6 +213,7 @@ export function LiveView({
 	useEffect(() => {
 		// Enable autoscroll for new session
 		autoscrollEnabledRef.current = true;
+		isInitialLoadRef.current = true;
 		setIsAtBottom(true);
 		setShowBanner(false);
 		setShowTopIndicator(false);
@@ -230,10 +248,59 @@ export function LiveView({
 		}
 	}, [jumpToBottomTrigger]);
 
+	// Keyboard navigation: Home/End/PageUp/PageDown for transcript scrolling
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+			if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+
+			const container = containerRef.current;
+			if (!container) return;
+
+			switch (e.key) {
+				case 'Home':
+					e.preventDefault();
+					container.scrollTop = 0;
+					autoscrollEnabledRef.current = false;
+					setIsAtBottom(false);
+					break;
+				case 'End':
+					e.preventDefault();
+					container.scrollTop = container.scrollHeight;
+					autoscrollEnabledRef.current = true;
+					setIsAtBottom(true);
+					setShowBanner(false);
+					if (bannerTimeoutRef.current) {
+						clearTimeout(bannerTimeoutRef.current);
+						bannerTimeoutRef.current = null;
+					}
+					onJumpToBottom();
+					break;
+				case 'PageUp':
+					e.preventDefault();
+					container.scrollTo({
+						top: container.scrollTop - container.clientHeight,
+						behavior: 'smooth',
+					});
+					break;
+				case 'PageDown':
+					e.preventDefault();
+					container.scrollTo({
+						top: container.scrollTop + container.clientHeight,
+						behavior: 'smooth',
+					});
+					break;
+			}
+		};
+
+		window.addEventListener('keydown', handleKeyDown);
+		return () => window.removeEventListener('keydown', handleKeyDown);
+	}, [onJumpToBottom]);
+
 	// Jump to bottom handler - scroll to scrollHeight to show newest entries
 	const handleJumpToBottom = useCallback(() => {
 		if (containerRef.current) {
-			containerRef.current.scrollTop = containerRef.current.scrollHeight;
+			containerRef.current.scrollTo({ top: containerRef.current.scrollHeight, behavior: 'smooth' });
 		}
 		// Enable autoscroll when user jumps to bottom
 		autoscrollEnabledRef.current = true;
@@ -253,7 +320,7 @@ export function LiveView({
 				<div className="header-info">
 					<span className="session-type-badge live">LIVE</span>
 					{sessionTitle && <span className="session-title">{sessionTitle}</span>}
-					<span className="session-id">{sessionId.slice(0, 8)}...</span>
+					<span className="session-id">{sessionId}</span>
 					<span className="entry-count-indicator">
 						{displayEntries.length} entries
 						{isConnected ? '' : ' (disconnected)'}
@@ -315,19 +382,6 @@ export function LiveView({
 			<div ref={containerRef} className="live-view-container" onScroll={handleScroll}>
 				{/* Normal column container - inner */}
 				<div className="live-view-inner">
-					{/* View Full History indicator at TOP of buffer (debounced) */}
-					{showTopIndicator && displayEntries.length > 0 && (
-						<div className="view-full-history-indicator">
-							<button
-								type="button"
-								className="view-full-history-button"
-								onClick={onViewFullHistory}
-							>
-								Viewing last {displayEntries.length} entries - View Full History
-							</button>
-						</div>
-					)}
-
 					{/* Entries in natural order: oldest first, newest last */}
 					{displayEntries.length === 0 ? (
 						<div className="empty-transcript">
@@ -344,6 +398,13 @@ export function LiveView({
 					)}
 				</div>
 			</div>
+
+			{/* View Full History indicator (floating) - shows when near top (debounced) */}
+			{showTopIndicator && displayEntries.length > 0 && (
+				<button type="button" className="view-full-history-indicator" onClick={onViewFullHistory}>
+					{displayEntries.length} entries &middot; View Full History &#x2191;
+				</button>
+			)}
 
 			{/* New entries indicator (floating) - shows when scrolled up (debounced) */}
 			{showBanner && newEntriesCount > 0 && (

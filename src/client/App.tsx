@@ -143,12 +143,16 @@ export function App() {
 	// }, [sessions, config.sessionTitleCommand, config.sessionTitleIntervalMs]);
 
 	// SSE reconnect settings from config
-	const sseMaxRetries = config.sseMaxRetries;
 	const sseBaseDelayMs = config.sseBaseDelayMs;
 	const sseMaxDelayMs = config.sseMaxDelayMs;
 
-	// Visibility reconnect - force SSE reconnect when tab returns from background
-	const [visibilityReconnectTrigger, setVisibilityReconnectTrigger] = useState(0);
+	// SSE reconnect trigger - increment to force all SSE effects to re-run
+	const [reconnectTrigger, setReconnectTrigger] = useState(0);
+
+	// Track last SSE message time per connection for stale detection
+	const lastSessionListMsgRef = useRef(Date.now());
+	const lastTranscriptMsgRef = useRef(Date.now());
+	const lastReconnectAtRef = useRef(0);
 
 	// Ref to track current session ID (prevents cross-contamination during session switches)
 	const currentSessionIdRef = useRef<string | null>(null);
@@ -186,8 +190,16 @@ export function App() {
 	const switchToArchiveRef = useRef(() => {});
 	const handleSwitchToLiveRef = useRef(() => {});
 
+	// Ref for handleSelectSession - used in SSE handler and URL param handling
+	const handleSelectSessionRef = useRef<(session: Session) => void>(() => {});
+
+	// Pending session ID from URL param (?session=X) - consumed on first session list load
+	const pendingSessionSelectRef = useRef<string | null>(
+		new URLSearchParams(window.location.search).get('session'),
+	);
+
 	// SSE connection for session list (push-based, no polling)
-	// biome-ignore lint/correctness/useExhaustiveDependencies: visibilityReconnectTrigger intentionally triggers reconnect
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reconnectTrigger intentionally triggers reconnect
 	useEffect(() => {
 		let eventSource: EventSource | null = null;
 		let retryCount = 0;
@@ -198,22 +210,47 @@ export function App() {
 
 			eventSource.onopen = () => {
 				console.info('[SSE:SessionList] Connected');
+				retryCount = 0;
 			};
 
 			eventSource.onmessage = (event) => {
+				lastSessionListMsgRef.current = Date.now();
 				try {
 					const data = JSON.parse(event.data);
+					if (data.type === 'heartbeat') return;
+
+					// Remote session selection (from orbit-session script)
+					if (data.type === 'select-session' && data.sessionId) {
+						setSessions((current) => {
+							const session = current.find((s) => s.id === data.sessionId);
+							if (session) handleSelectSessionRef.current(session);
+							return current;
+						});
+						return;
+					}
+
 					if (data.type === 'sessions' && Array.isArray(data.sessions)) {
-						// Only update if sessions actually changed (avoids re-renders from timestamp updates)
 						setSessions((prev) => {
 							if (prev.length !== data.sessions.length) return data.sessions;
-							// Compare by ID and order only - active is computed client-side
-							const changed = prev.some((s, i) => s.id !== data.sessions[i]?.id);
+							const changed = prev.some((s, i) => {
+								const n = data.sessions[i];
+								return s.id !== n?.id || s.mtime !== n?.mtime || s.name !== n?.name;
+							});
 							return changed ? data.sessions : prev;
 						});
 						setLoading(false);
 						setError(null);
-						retryCount = 0;
+
+						// Handle ?session=X URL param on first session list load
+						const pending = pendingSessionSelectRef.current;
+						if (pending) {
+							pendingSessionSelectRef.current = null;
+							const session = data.sessions.find((s: Session) => s.id === pending);
+							if (session) {
+								handleSelectSessionRef.current(session);
+								window.history.replaceState({}, '', window.location.pathname);
+							}
+						}
 					}
 				} catch {
 					// Parse error
@@ -221,19 +258,9 @@ export function App() {
 			};
 
 			eventSource.onerror = () => {
-				const readyState = eventSource?.readyState;
-				console.warn(
-					`[SSE:SessionList] Error, readyState=${readyState}, attempt ${retryCount + 1}/${sseMaxRetries}`,
-				);
+				console.warn(`[SSE:SessionList] Error, retrying (attempt ${retryCount + 1})`);
 				eventSource?.close();
 				retryCount++;
-
-				if (retryCount > sseMaxRetries) {
-					setError('Connection to server lost');
-					setLoading(false);
-					return;
-				}
-
 				const delay = Math.min(sseBaseDelayMs * 2 ** (retryCount - 1), sseMaxDelayMs);
 				retryTimeout = setTimeout(connect, delay);
 			};
@@ -247,7 +274,7 @@ export function App() {
 				clearTimeout(retryTimeout);
 			}
 		};
-	}, [sseMaxRetries, sseBaseDelayMs, sseMaxDelayMs, visibilityReconnectTrigger]);
+	}, [sseBaseDelayMs, sseMaxDelayMs, reconnectTrigger]);
 
 	// Manual refresh (for retry button)
 	const handleRefresh = useCallback(() => {
@@ -264,7 +291,7 @@ export function App() {
 	const [reloadTrigger, setReloadTrigger] = useState(0);
 
 	// Connect to SSE stream when session selected
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadTrigger/visibilityReconnectTrigger intentionally trigger reconnect
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadTrigger/reconnectTrigger intentionally trigger reconnect
 	useEffect(() => {
 		if (!selectedSession) {
 			currentSessionIdRef.current = null;
@@ -274,7 +301,6 @@ export function App() {
 			return;
 		}
 
-		// Update ref immediately to prevent race conditions
 		currentSessionIdRef.current = selectedSession.id;
 
 		let eventSource: EventSource | null = null;
@@ -287,28 +313,27 @@ export function App() {
 
 			eventSource.onopen = () => {
 				console.info(`[SSE:Transcript] Connected to session ${selectedSession.id.slice(0, 8)}...`);
+				retryCount = 0;
+				setSseError(null);
+				setIsSSEConnected(true);
 			};
 
 			eventSource.onmessage = (event) => {
+				lastTranscriptMsgRef.current = Date.now();
 				try {
 					const data = JSON.parse(event.data);
 
-					// Check against ref (not closure) to prevent cross-contamination during session switches
 					if (data.sessionId && data.sessionId !== currentSessionIdRef.current) {
 						return;
 					}
 
-					retryCount = 0;
-					setSseError(null);
-					setIsSSEConnected(true);
+					if (data.type === 'heartbeat') return;
 
 					if (data.type === 'init') {
 						if (isFirstInit || data.entries.length > 0) {
-							// Atomic update: entries + numPrepended reset together
 							setEntryState({ entries: data.entries, numPrepended: 0 });
 							const stats = calculateTokens(data.entries);
 							setTokens(stats);
-							// Capture windowed loading state
 							setCursor(data.cursor ?? null);
 							setHasMore(data.hasMore ?? false);
 						}
@@ -318,13 +343,9 @@ export function App() {
 						const newEntries = data.entries as ParsedEntry[];
 						if (newEntries.length === 0) return;
 
-						// Batched append via ref prevents SSE reconnects from dependency changes
 						batchedAppendEntriesRef.current(newEntries);
-
-						// Track new entries since archive snapshot (for badge in Archive mode)
 						setNewEntriesSinceSnapshot((prev) => prev + newEntries.length);
 
-						// Token updates are immediate since they're lightweight
 						setTokens((prev) => {
 							let stats = prev;
 							for (const entry of newEntries) {
@@ -347,20 +368,12 @@ export function App() {
 			};
 
 			eventSource.onerror = () => {
-				const readyState = eventSource?.readyState;
 				console.warn(
-					`[SSE:Transcript] Error for session ${selectedSession?.id?.slice(0, 8)}, readyState=${readyState}, attempt ${retryCount + 1}/${sseMaxRetries}`,
+					`[SSE:Transcript] Error for ${selectedSession?.id?.slice(0, 8)}, retrying (attempt ${retryCount + 1})`,
 				);
 				eventSource?.close();
 				setIsSSEConnected(false);
-
 				retryCount++;
-				if (retryCount > sseMaxRetries) {
-					setSseError(`Connection lost after ${sseMaxRetries} retries`);
-					setTranscriptLoading(false);
-					return;
-				}
-
 				const delay = Math.min(sseBaseDelayMs * 2 ** (retryCount - 1), sseMaxDelayMs);
 				retryTimeout = setTimeout(connect, delay);
 			};
@@ -375,15 +388,7 @@ export function App() {
 				clearTimeout(retryTimeout);
 			}
 		};
-	}, [
-		selectedSession,
-		reloadTrigger,
-		visibilityReconnectTrigger,
-		sseMaxRetries,
-		sseBaseDelayMs,
-		sseMaxDelayMs,
-		// batchedAppendEntries accessed via ref to prevent reconnects from callback changes
-	]);
+	}, [selectedSession, reloadTrigger, reconnectTrigger, sseBaseDelayMs, sseMaxDelayMs]);
 
 	const handleSelectSession = useCallback(
 		(session: Session) => {
@@ -411,6 +416,9 @@ export function App() {
 		[clearBatchedEntries],
 	);
 
+	// Keep ref in sync for SSE handler access
+	handleSelectSessionRef.current = handleSelectSession;
+
 	const handleReload = useCallback(() => {
 		setEntryState({ entries: [], numPrepended: 0 });
 		setTokens(null);
@@ -420,22 +428,44 @@ export function App() {
 		setReloadTrigger((prev) => prev + 1);
 	}, []);
 
-	// Reconnect SSE when tab returns from background (prevents stale connections)
+	// Multi-layer SSE recovery: focus + resume + visibilitychange
+	// visibilitychange only fires on tab switch/minimize, NOT when window is behind other apps.
+	// focus fires reliably when user clicks the browser window on any platform.
+	// resume fires when Chrome unfreezes a frozen tab (Energy Saver, 5min background).
 	useEffect(() => {
-		let hiddenAt: number | null = null;
+		const SSE_STALE_MS = 30_000;
+		const RECONNECT_COOLDOWN_MS = 5_000;
 
-		const handleVisibilityChange = () => {
-			if (document.hidden) {
-				hiddenAt = Date.now();
-			} else if (hiddenAt && Date.now() - hiddenAt > 30_000) {
-				console.info('[SSE] Tab returned from background, forcing reconnect');
-				setVisibilityReconnectTrigger((prev) => prev + 1);
-				hiddenAt = null;
+		const forceReconnect = (reason: string) => {
+			const now = Date.now();
+			if (now - lastReconnectAtRef.current < RECONNECT_COOLDOWN_MS) return;
+			lastReconnectAtRef.current = now;
+			console.info(`[SSE] Reconnecting: ${reason}`);
+			setReconnectTrigger((prev) => prev + 1);
+		};
+
+		const checkStaleAndReconnect = (reason: string) => {
+			const now = Date.now();
+			const oldest = Math.min(lastSessionListMsgRef.current, lastTranscriptMsgRef.current);
+			if (now - oldest > SSE_STALE_MS) {
+				forceReconnect(reason);
 			}
 		};
 
-		document.addEventListener('visibilitychange', handleVisibilityChange);
-		return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+		const handleFocus = () => checkStaleAndReconnect('window focused, connection stale');
+		const handleResume = () => forceReconnect('tab resumed from frozen state');
+		const handleVisibility = () => {
+			if (!document.hidden) checkStaleAndReconnect('tab became visible, connection stale');
+		};
+
+		window.addEventListener('focus', handleFocus);
+		document.addEventListener('resume', handleResume);
+		document.addEventListener('visibilitychange', handleVisibility);
+		return () => {
+			window.removeEventListener('focus', handleFocus);
+			document.removeEventListener('resume', handleResume);
+			document.removeEventListener('visibilitychange', handleVisibility);
+		};
 	}, []);
 
 	// Load older entries (windowed loading)
@@ -820,7 +850,7 @@ export function App() {
 							viewMode === 'live' ? (
 								<LiveView
 									sessionId={selectedSession.id}
-									sessionTitle={sessionTitles[selectedSession.id] ?? null}
+									sessionTitle={selectedSession.name ?? sessionTitles[selectedSession.id] ?? null}
 									entries={entries}
 									tokens={tokens}
 									isConnected={isSSEConnected}
@@ -840,7 +870,7 @@ export function App() {
 							) : (
 								<ArchiveView
 									session={selectedSession}
-									sessionTitle={sessionTitles[selectedSession.id] ?? null}
+									sessionTitle={selectedSession.name ?? sessionTitles[selectedSession.id] ?? null}
 									snapshotTimestamp={archiveSnapshotTimestamp}
 									entries={archiveEntries}
 									isLoading={archiveLoading}
@@ -868,7 +898,7 @@ export function App() {
 							// Legacy TranscriptView
 							<TranscriptView
 								session={selectedSession}
-								sessionTitle={sessionTitles[selectedSession.id] ?? null}
+								sessionTitle={selectedSession.name ?? sessionTitles[selectedSession.id] ?? null}
 								entries={entries}
 								tokens={tokens}
 								transcriptLoading={transcriptLoading}

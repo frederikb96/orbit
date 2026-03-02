@@ -16,6 +16,9 @@ import { CopyButton } from './CopyButton.tsx';
 import { LazyDiffView } from './LazyDiffView.tsx';
 import { Markdown } from './Markdown.tsx';
 
+// Threshold for showing "Back to Live" floating indicator
+const NEAR_BOTTOM_THRESHOLD = 500;
+
 // Fractional item size measurement for sub-pixel accuracy
 function fractionalItemSize(element: HTMLElement) {
 	return element.getBoundingClientRect().height;
@@ -83,6 +86,28 @@ export function ArchiveView({
 	const isAtBottomRef = useRef(true);
 	const isInitialScrollDone = useRef(false);
 	const prevEntriesLength = useRef(0);
+
+	// Near-bottom detection for floating "Back to Live" indicator
+	const [showBackToLive, setShowBackToLive] = useState(false);
+	const scrollListenerCleanupRef = useRef<(() => void) | null>(null);
+	const scrollerElRef = useRef<HTMLElement | null>(null);
+
+	const handleScrollerRef = useCallback((el: HTMLElement | Window | null) => {
+		scrollListenerCleanupRef.current?.();
+		scrollListenerCleanupRef.current = null;
+		if (!(el instanceof HTMLElement)) {
+			scrollerElRef.current = null;
+			return;
+		}
+		scrollerElRef.current = el;
+		const onScroll = () => {
+			const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_THRESHOLD;
+			setShowBackToLive(nearBottom);
+		};
+		el.addEventListener('scroll', onScroll, { passive: true });
+		scrollListenerCleanupRef.current = () => el.removeEventListener('scroll', onScroll);
+		requestAnimationFrame(onScroll);
+	}, []);
 
 	// Anchor preservation for refresh
 	const [anchorEntryId, setAnchorEntryId] = useState<string | null>(null);
@@ -230,6 +255,54 @@ export function ArchiveView({
 		}
 	}, [displayEntries.length, firstItemIndex]);
 
+	// Keyboard navigation: Home/End/PageUp/PageDown for transcript scrolling
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+			if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+
+			switch (e.key) {
+				case 'Home':
+					e.preventDefault();
+					virtuosoRef.current?.scrollToIndex({
+						index: firstItemIndex,
+						align: 'start',
+						behavior: 'auto',
+					});
+					break;
+				case 'End':
+					e.preventDefault();
+					virtuosoRef.current?.scrollToIndex({
+						index: firstItemIndex + displayEntries.length - 1,
+						align: 'end',
+						behavior: 'auto',
+					});
+					break;
+				case 'PageUp':
+					e.preventDefault();
+					if (scrollerElRef.current) {
+						scrollerElRef.current.scrollTo({
+							top: scrollerElRef.current.scrollTop - scrollerElRef.current.clientHeight,
+							behavior: 'smooth',
+						});
+					}
+					break;
+				case 'PageDown':
+					e.preventDefault();
+					if (scrollerElRef.current) {
+						scrollerElRef.current.scrollTo({
+							top: scrollerElRef.current.scrollTop + scrollerElRef.current.clientHeight,
+							behavior: 'smooth',
+						});
+					}
+					break;
+			}
+		};
+
+		window.addEventListener('keydown', handleKeyDown);
+		return () => window.removeEventListener('keydown', handleKeyDown);
+	}, [firstItemIndex, displayEntries.length]);
+
 	// Scroll to bottom within Archive (for new entries badge) (Row 13: use virtual index)
 	const handleScrollToBottom = useCallback(() => {
 		virtuosoRef.current?.scrollToIndex({
@@ -359,6 +432,7 @@ export function ArchiveView({
 						<Virtuoso
 							key={session.id}
 							ref={virtuosoRef}
+							scrollerRef={handleScrollerRef}
 							data={displayEntries}
 							firstItemIndex={firstItemIndex}
 							computeItemKey={computeItemKey}
@@ -399,7 +473,12 @@ export function ArchiveView({
 				)}
 			</div>
 
-			{/* Archive is a frozen snapshot - no "new entries" badge (only makes sense in Live mode) */}
+			{/* Back to Live indicator (floating) - shows when near bottom */}
+			{showBackToLive && (
+				<button type="button" className="back-to-live-indicator" onClick={onSwitchToLive}>
+					&#x26A1; Back to Live &#x2193;
+				</button>
+			)}
 		</div>
 	);
 }
