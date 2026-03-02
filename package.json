@@ -1,6 +1,6 @@
 {
 	"name": "orbit",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"type": "module",
 	"description": "Web-based Claude Code transcript viewer with real-time streaming",
 	"author": "Frederik Berg",

@@ -17,13 +17,15 @@ Web-based Claude Code transcript viewer with real-time streaming.
 
 ## Features
 
-- **Real-time streaming** - SSE-based live updates as transcripts change
-- **Session discovery** - Finds sessions, agents, and subagents automatically
-- **Dark theme** - Easy on the eyes for long sessions
-- **Pagination** - Handles large transcripts (30MB+) efficiently
-- **Active indicators** - Shows which sessions are currently being written
-- **MRU switcher** - Alt+Tab style session switching
-- **Daemon mode** - Background service with journald logging
+- **Dual-mode viewing** - Live mode (real-time streaming) and Archive mode (frozen snapshot with virtualized scrolling)
+- **In-transcript search** - Ctrl+F with match navigation, auto-expand of collapsed blocks, and gold text highlighting
+- **Session search** - Fuzzy search across all sessions on disk by name and UUID (Ctrl+K)
+- **Syntax highlighting** - Shiki-based with lazy loading for code blocks, diffs, and tool results
+- **Markdown rendering** - GFM with XSS sanitization for messages and responses
+- **Light/dark/system theme** - Toggle in sidebar header, persisted to localStorage
+- **Session discovery** - Finds sessions, agents, and subagents automatically with active indicators
+- **MRU switcher** - Alt+Tab style session switching (Shift+Alt+Q)
+- **Daemon mode** - Background service with systemd support and journald logging
 
 ## Requirements
 
@@ -88,21 +90,27 @@ When managed by systemd, the CLI detects this automatically — `orbit stop` red
 
 ## Keyboard Shortcuts
 
+**Search:**
+
+- **Ctrl+F** - In-transcript search (Enter/Shift+Enter to navigate matches)
+- **Ctrl+K** - Focus session search bar
+
 **Plain keys** (in transcript views):
 
 - **Home** - Scroll to top
-- **End** - Scroll to bottom (enables autoscroll)
-- **PageUp** - Scroll up one page
-- **PageDown** - Scroll down one page
+- **End** - Scroll to bottom
+- **PageUp/PageDown** - Scroll one page
 
 **Shift+Alt** modifier:
 
+- **H** - Toggle Live/Archive mode
 - **Q** - MRU session switcher (hold modifiers, press Q to cycle, release to confirm)
-- **PageUp** or **,** - Previous session (up in list)
-- **PageDown** or **.** - Next session (down in list)
+- **,** or **PageUp** - Previous session
+- **.** or **PageDown** - Next session
 - **T** - Toggle thinking block expansion
-- **O** - Toggle tool call expansion
-- **S** - Enable autoscroll and jump to bottom
+- **E** - Toggle edit/write tool expansion
+- **O** - Toggle other tool expansion
+- **S** - Jump to bottom
 - **R** - Reload transcript
 
 ## Session Discovery

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-02
+
 ### Added
 
 - **Session search:** Fuzzy search across ALL sessions on disk (not just tracked) by name and UUID via sidebar search bar (Ctrl+K to focus)
