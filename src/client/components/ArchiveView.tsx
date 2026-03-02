@@ -223,11 +223,23 @@ export function ArchiveView({
 		return () => window.removeEventListener('keydown', handleKeyDown);
 	}, [search.open, hasMore, onLoadAll]);
 
-	// Binary search scroll: converges to exact entry position regardless of item height variance
+	// Navigate to search match: fast path for nearby entries, binary search for distant ones
 	useEffect(() => {
 		if (search.navigateCounter > 0 && search.currentEntryIndex !== null && scrollerElRef.current) {
 			const el = scrollerElRef.current;
 			const target = search.currentEntryIndex;
+			const queryLower = search.query.toLowerCase();
+
+			// Fast path: target already rendered in DOM (nearby/on-screen match)
+			const existingMatch = el.querySelector('.search-match-current');
+			if (existingMatch) {
+				existingMatch.scrollIntoView({ block: 'center', behavior: 'instant' });
+				requestAnimationFrame(() => scrollToMatchText(existingMatch, queryLower, el));
+				return;
+			}
+
+			// Slow path: binary search with hidden content to prevent visual jitter
+			el.style.visibility = 'hidden';
 			let lo = 0;
 			let hi = el.scrollHeight;
 
@@ -240,18 +252,20 @@ export function ArchiveView({
 			function step() {
 				const match = el.querySelector('.search-match-current');
 				if (match) {
-					match.scrollIntoView({ block: 'start', behavior: 'instant' });
-					requestAnimationFrame(() => {
-						scrollToMatchText(match, search.query.toLowerCase(), el);
-					});
+					match.scrollIntoView({ block: 'center', behavior: 'instant' });
+					el.style.visibility = '';
+					requestAnimationFrame(() => scrollToMatchText(match, queryLower, el));
 					return;
 				}
-				if (attempt >= 20 || hi - lo < 2) return;
+				if (attempt >= 20 || hi - lo < 2) {
+					el.style.visibility = '';
+					return;
+				}
 				attempt++;
 
 				const items = el.querySelectorAll('[data-item-index]');
 				if (items.length === 0) {
-					setTimeout(step, 60);
+					requestAnimationFrame(step);
 					return;
 				}
 
@@ -264,9 +278,9 @@ export function ArchiveView({
 					lo = el.scrollTop;
 				}
 				el.scrollTo({ top: (lo + hi) / 2, behavior: 'instant' });
-				setTimeout(step, 60);
+				requestAnimationFrame(step);
 			}
-			setTimeout(step, 60);
+			requestAnimationFrame(step);
 		}
 	}, [
 		search.navigateCounter,

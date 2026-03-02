@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Auto-expand on search:** Current search match auto-expands collapsed thinking blocks, tool calls, and tool results
 - **Scroll-within-entry:** Search navigation scrolls inner scrollboxes (code blocks, tool results) and outer viewport to reveal matching text
 
+### Fixed
+
+- **Search scroll jitter:** Two-tier navigation eliminates scrollbar bouncing — fast path (DOM check) for nearby matches, `visibility:hidden` binary search with `requestAnimationFrame` for distant matches
+
 ## [0.2.0] - 2026-03-02
 
 ### Added
