@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Full transcript load on search:** Archive view automatically loads all remaining entries when search opens, enabling complete transcript search
 - **In-text search highlighting:** CSS Custom Highlight API overlays gold highlights on matching text within visible entries, with MutationObserver for Virtuoso DOM recycling
 - **Binary search scroll navigation:** Converges to exact entry position in Archive view regardless of variable item heights (replaces broken Virtuoso `scrollToIndex`)
+- **Auto-expand on search:** Current search match auto-expands collapsed thinking blocks, tool calls, and tool results
+- **Scroll-within-entry:** Search navigation scrolls inner scrollboxes (code blocks, tool results) and outer viewport to reveal matching text
 
 ## [0.2.0] - 2026-03-02
 

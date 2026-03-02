@@ -22,6 +22,46 @@ import { SearchOverlay } from './SearchOverlay.tsx';
 // Threshold for showing "Back to Live" floating indicator
 const NEAR_BOTTOM_THRESHOLD = 500;
 
+// Scroll the nearest scrollable ancestor to reveal matching text within an entry
+function scrollToMatchText(entry: Element, queryLower: string, outerScroller: HTMLElement) {
+	if (!queryLower) return;
+	const walker = document.createTreeWalker(entry, NodeFilter.SHOW_TEXT);
+	for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+		const text = node.textContent?.toLowerCase() ?? '';
+		const idx = text.indexOf(queryLower);
+		if (idx === -1) continue;
+
+		const range = new Range();
+		range.setStart(node, idx);
+		range.setEnd(node, idx + queryLower.length);
+
+		// Scroll inner scrollbox if match is inside one
+		let parent = node.parentElement;
+		while (parent && parent !== entry) {
+			if (parent.scrollHeight > parent.clientHeight + 1) {
+				const style = getComputedStyle(parent);
+				if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+					const rangeRect = range.getBoundingClientRect();
+					const parentRect = parent.getBoundingClientRect();
+					if (rangeRect.top < parentRect.top || rangeRect.bottom > parentRect.bottom) {
+						parent.scrollTop = rangeRect.top - parentRect.top + parent.scrollTop - 20;
+					}
+					break;
+				}
+			}
+			parent = parent.parentElement;
+		}
+
+		// Scroll outer Virtuoso scroller if match is outside viewport
+		const updatedRect = range.getBoundingClientRect();
+		const scrollerRect = outerScroller.getBoundingClientRect();
+		if (updatedRect.top < scrollerRect.top || updatedRect.bottom > scrollerRect.bottom) {
+			outerScroller.scrollTop += updatedRect.top - scrollerRect.top - 100;
+		}
+		return;
+	}
+}
+
 // Fractional item size measurement for sub-pixel accuracy
 function fractionalItemSize(element: HTMLElement) {
 	return element.getBoundingClientRect().height;
@@ -201,6 +241,9 @@ export function ArchiveView({
 				const match = el.querySelector('.search-match-current');
 				if (match) {
 					match.scrollIntoView({ block: 'start', behavior: 'instant' });
+					requestAnimationFrame(() => {
+						scrollToMatchText(match, search.query.toLowerCase(), el);
+					});
 					return;
 				}
 				if (attempt >= 20 || hi - lo < 2) return;
@@ -225,7 +268,13 @@ export function ArchiveView({
 			}
 			setTimeout(step, 60);
 		}
-	}, [search.navigateCounter, search.currentEntryIndex, displayEntries.length, firstItemIndex]);
+	}, [
+		search.navigateCounter,
+		search.currentEntryIndex,
+		search.query,
+		displayEntries.length,
+		firstItemIndex,
+	]);
 
 	// Disable progressive loading while loadAll is running
 	const effectiveIsLoading = isLoading || isLoadingAll;
@@ -402,7 +451,11 @@ export function ArchiveView({
 				<div
 					className={`${isMatch ? 'search-match' : ''} ${isCurrent ? 'search-match-current' : ''}`}
 				>
-					<MemoizedEntryCard entry={entry} entriesCount={displayEntries.length} />
+					<MemoizedEntryCard
+						entry={entry}
+						entriesCount={displayEntries.length}
+						forceExpand={isCurrent}
+					/>
 				</div>
 			);
 		},
@@ -580,11 +633,13 @@ export function ArchiveView({
 interface EntryCardProps {
 	entry: ParsedEntry;
 	entriesCount: number;
+	forceExpand?: boolean;
 }
 
 const MemoizedEntryCard = memo(function EntryCard({
 	entry,
 	entriesCount: _entriesCount,
+	forceExpand = false,
 }: EntryCardProps) {
 	const { expandState } = useEntryContext();
 
@@ -592,9 +647,9 @@ const MemoizedEntryCard = memo(function EntryCard({
 		case 'user':
 			return <MemoizedUserEntry entry={entry} />;
 		case 'assistant':
-			return <MemoizedAssistantEntry entry={entry} />;
+			return <MemoizedAssistantEntry entry={entry} forceExpand={forceExpand} />;
 		case 'tool_result':
-			return <MemoizedToolResultEntry entry={entry} expanded={expandState.other} />;
+			return <MemoizedToolResultEntry entry={entry} expanded={expandState.other || forceExpand} />;
 		case 'system':
 			return <MemoizedSystemEntry entry={entry} />;
 		default:
@@ -617,15 +672,19 @@ const MemoizedUserEntry = memo(function UserEntry({ entry }: { entry: ParsedEntr
 
 interface AssistantEntryProps {
 	entry: ParsedEntry;
+	forceExpand?: boolean;
 }
 
-const MemoizedAssistantEntry = memo(function AssistantEntry({ entry }: AssistantEntryProps) {
+const MemoizedAssistantEntry = memo(function AssistantEntry({
+	entry,
+	forceExpand = false,
+}: AssistantEntryProps) {
 	const { expandState, getToolResult } = useEntryContext();
 
 	return (
 		<>
 			{entry.thinking && (
-				<details className="entry thinking-entry" open={expandState.thinking}>
+				<details className="entry thinking-entry" open={expandState.thinking || forceExpand}>
 					<summary className="entry-header">
 						<span className="role-badge thinking">THINKING</span>
 						<span className="timestamp">{formatTime(entry.timestamp)}</span>
@@ -658,11 +717,12 @@ const MemoizedAssistantEntry = memo(function AssistantEntry({ entry }: Assistant
 				const category = getToolCategory(tool.name);
 				const expandGroup = getExpandGroup(category);
 				const expanded =
-					expandGroup === 'read'
+					forceExpand ||
+					(expandGroup === 'read'
 						? expandState.read
 						: expandGroup === 'edit'
 							? expandState.edit
-							: expandState.other;
+							: expandState.other);
 				return (
 					<MemoizedToolCallBlock
 						key={tool.id}
