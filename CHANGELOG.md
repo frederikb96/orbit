@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **On-demand session activation:** `select-session` API now activates untracked sessions automatically, making Kitty shortcut (Shift+Alt+K) work for any historical session
 - **In-transcript search:** Ctrl+F opens floating search overlay in both Live and Archive views — searches entry content, thinking blocks, tool calls, and tool results with match navigation (Enter/Shift+Enter) and entry-level highlighting
 - **Full transcript load on search:** Archive view automatically loads all remaining entries when search opens, enabling complete transcript search
+- **In-text search highlighting:** CSS Custom Highlight API overlays gold highlights on matching text within visible entries, with MutationObserver for Virtuoso DOM recycling
+- **Binary search scroll navigation:** Converges to exact entry position in Archive view regardless of variable item heights (replaces broken Virtuoso `scrollToIndex`)
 
 ## [0.2.0] - 2026-03-02
 

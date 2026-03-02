@@ -1924,3 +1924,8 @@ button:focus-visible {
 	background: rgba(88, 166, 255, 0.08);
 	border-radius: 6px;
 }
+
+::highlight(search-result) {
+	background-color: rgba(255, 196, 0, 0.4);
+	color: inherit;
+}

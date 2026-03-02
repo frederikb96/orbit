@@ -17,6 +17,7 @@ import { getExpandGroup, getToolCategory } from '../../shared/tools.ts';
 import type { ParsedEntry, ParsedToolResult } from '../../types.ts';
 import { useConfig } from '../ConfigContext.tsx';
 import { EntryProvider, type ExpandState, useEntryContext } from '../EntryContext.tsx';
+import { useTextHighlight } from '../hooks/useTextHighlight.ts';
 import { useTranscriptSearch } from '../hooks/useTranscriptSearch.ts';
 import { AnsiText } from './AnsiText.tsx';
 import { CodeBlock } from './CodeBlock.tsx';
@@ -147,6 +148,7 @@ export function LiveView({
 
 	// Transcript search
 	const search = useTranscriptSearch(displayEntries, getToolResult);
+	useTextHighlight(containerRef, search.query, search.isOpen);
 
 	// Ctrl+F interception
 	useEffect(() => {
@@ -309,14 +311,14 @@ export function LiveView({
 					e.preventDefault();
 					container.scrollTo({
 						top: container.scrollTop - container.clientHeight,
-						behavior: 'auto',
+						behavior: 'instant',
 					});
 					break;
 				case 'PageDown':
 					e.preventDefault();
 					container.scrollTo({
 						top: container.scrollTop + container.clientHeight,
-						behavior: 'auto',
+						behavior: 'instant',
 					});
 					break;
 			}

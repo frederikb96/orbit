@@ -10,6 +10,7 @@ import { getExpandGroup, getToolCategory } from '../../shared/tools.ts';
 import type { ParsedEntry, ParsedToolResult, Session, TokenStats } from '../../types.ts';
 import { useConfig } from '../ConfigContext.tsx';
 import { EntryProvider, type ExpandState, useEntryContext } from '../EntryContext.tsx';
+import { useTextHighlight } from '../hooks/useTextHighlight.ts';
 import { useTranscriptSearch } from '../hooks/useTranscriptSearch.ts';
 import { AnsiText } from './AnsiText.tsx';
 import { CodeBlock } from './CodeBlock.tsx';
@@ -162,6 +163,7 @@ export function ArchiveView({
 
 	// Transcript search
 	const search = useTranscriptSearch(displayEntries, getToolResult);
+	useTextHighlight(scrollerElRef, search.query, search.isOpen);
 
 	// Sync external loading state into search hook
 	useEffect(() => {
@@ -181,16 +183,49 @@ export function ArchiveView({
 		return () => window.removeEventListener('keydown', handleKeyDown);
 	}, [search.open, hasMore, onLoadAll]);
 
-	// Scroll to match on navigation via native scroll (Virtuoso's scrollToIndex
-	// doesn't work reliably with large firstItemIndex values)
+	// Binary search scroll: converges to exact entry position regardless of item height variance
 	useEffect(() => {
 		if (search.navigateCounter > 0 && search.currentEntryIndex !== null && scrollerElRef.current) {
 			const el = scrollerElRef.current;
-			const fraction = search.currentEntryIndex / displayEntries.length;
-			const targetTop = fraction * (el.scrollHeight - el.clientHeight);
-			el.scrollTo({ top: targetTop, behavior: 'auto' });
+			const target = search.currentEntryIndex;
+			let lo = 0;
+			let hi = el.scrollHeight;
+
+			el.scrollTo({
+				top: (target / displayEntries.length) * hi,
+				behavior: 'instant',
+			});
+
+			let attempt = 0;
+			function step() {
+				const match = el.querySelector('.search-match-current');
+				if (match) {
+					match.scrollIntoView({ block: 'start', behavior: 'instant' });
+					return;
+				}
+				if (attempt >= 20 || hi - lo < 2) return;
+				attempt++;
+
+				const items = el.querySelectorAll('[data-item-index]');
+				if (items.length === 0) {
+					setTimeout(step, 60);
+					return;
+				}
+
+				const targetVirtual = target + firstItemIndex;
+				const firstVirtual = Number.parseInt(items[0].getAttribute('data-item-index')!);
+
+				if (targetVirtual < firstVirtual) {
+					hi = el.scrollTop;
+				} else {
+					lo = el.scrollTop;
+				}
+				el.scrollTo({ top: (lo + hi) / 2, behavior: 'instant' });
+				setTimeout(step, 60);
+			}
+			setTimeout(step, 60);
 		}
-	}, [search.navigateCounter, search.currentEntryIndex, displayEntries.length]);
+	}, [search.navigateCounter, search.currentEntryIndex, displayEntries.length, firstItemIndex]);
 
 	// Disable progressive loading while loadAll is running
 	const effectiveIsLoading = isLoading || isLoadingAll;
@@ -202,7 +237,7 @@ export function ArchiveView({
 			setTimeout(() => {
 				scrollerElRef.current?.scrollTo({
 					top: scrollerElRef.current.scrollHeight,
-					behavior: 'auto',
+					behavior: 'instant',
 				});
 			}, 50);
 		}
@@ -227,7 +262,7 @@ export function ArchiveView({
 		if (anchorIndex >= 0 && scrollerElRef.current) {
 			const fraction = anchorIndex / displayEntries.length;
 			const el = scrollerElRef.current;
-			el.scrollTo({ top: fraction * (el.scrollHeight - el.clientHeight), behavior: 'auto' });
+			el.scrollTo({ top: fraction * (el.scrollHeight - el.clientHeight), behavior: 'instant' });
 		}
 		pendingAnchorRestore.current = false;
 		setAnchorEntryId(null);
@@ -285,7 +320,7 @@ export function ArchiveView({
 			setTimeout(() => {
 				scrollerElRef.current?.scrollTo({
 					top: scrollerElRef.current.scrollHeight,
-					behavior: 'auto',
+					behavior: 'instant',
 				});
 			}, 50);
 		}
@@ -301,7 +336,7 @@ export function ArchiveView({
 				case 'Home':
 					e.preventDefault();
 					if (scrollerElRef.current) {
-						scrollerElRef.current.scrollTo({ top: 0, behavior: 'auto' });
+						scrollerElRef.current.scrollTo({ top: 0, behavior: 'instant' });
 					}
 					break;
 				case 'End':
@@ -309,7 +344,7 @@ export function ArchiveView({
 					if (scrollerElRef.current) {
 						scrollerElRef.current.scrollTo({
 							top: scrollerElRef.current.scrollHeight,
-							behavior: 'auto',
+							behavior: 'instant',
 						});
 					}
 					break;
@@ -318,7 +353,7 @@ export function ArchiveView({
 					if (scrollerElRef.current) {
 						scrollerElRef.current.scrollTo({
 							top: scrollerElRef.current.scrollTop - scrollerElRef.current.clientHeight,
-							behavior: 'auto',
+							behavior: 'instant',
 						});
 					}
 					break;
@@ -327,7 +362,7 @@ export function ArchiveView({
 					if (scrollerElRef.current) {
 						scrollerElRef.current.scrollTo({
 							top: scrollerElRef.current.scrollTop + scrollerElRef.current.clientHeight,
-							behavior: 'auto',
+							behavior: 'instant',
 						});
 					}
 					break;
