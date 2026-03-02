@@ -46,11 +46,51 @@ Open http://localhost:3000 in your browser.
 
 **Note:** Server binds to localhost only for security - not accessible from other machines.
 
+### Auto-start with systemd
+
+For automatic startup on login, create a user service at `~/.config/systemd/user/orbit.service`:
+
+```ini
+[Unit]
+Description=Orbit - Claude Code transcript viewer
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/path/to/orbit start --foreground
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orbit
+
+[Install]
+WantedBy=default.target
+```
+
+Adjust `ExecStart` to point to your `orbit` binary (typically `~/.bun/bin/orbit` after `bun link`). If `bun` isn't in systemd's PATH, set it via `Environment="PATH=..."`.
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now orbit
+```
+
+When managed by systemd, the CLI detects this automatically — `orbit stop` redirects to `systemctl`, `orbit status` shows the management mode, and `orbit logs` reads from the correct journal source.
+
 ## Keyboard Shortcuts
 
-All shortcuts use **Shift+Alt** modifier:
+**Plain keys** (in transcript views):
+
+- **Home** - Scroll to top
+- **End** - Scroll to bottom (enables autoscroll)
+- **PageUp** - Scroll up one page
+- **PageDown** - Scroll down one page
+
+**Shift+Alt** modifier:
 
 - **Q** - MRU session switcher (hold modifiers, press Q to cycle, release to confirm)
+- **PageUp** or **,** - Previous session (up in list)
+- **PageDown** or **.** - Next session (down in list)
 - **T** - Toggle thinking block expansion
 - **O** - Toggle tool call expansion
 - **S** - Enable autoscroll and jump to bottom

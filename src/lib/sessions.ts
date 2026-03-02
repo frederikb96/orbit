@@ -1,39 +1,88 @@
 /**
  * Session Manager Module
  *
- * Manages session discovery, caching, and watching.
- * Uses discovery.ts for efficient file scanning.
+ * Push-based session discovery with real-time updates.
+ * Uses @parcel/watcher events for incremental updates - no polling.
  */
 
-import { type FSWatcher, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import {
+	type Dirent,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	writeFileSync,
+} from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 import type { OrbitConfig, Session, SessionType } from '../types.ts';
-import { EventBuffer } from './buffer.ts';
 import { getConfig } from './config.ts';
 import { getNewestNFiles } from './discovery.ts';
-import { createWatcher } from './watcher.ts';
+import { type DirectoryWatcher, createWatcher } from './watcher.ts';
 
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const AGENT_ID_REGEX = /^agent-([a-f0-9]+)\.jsonl$/;
+function getSessionNamesPath(): string {
+	const xdgConfig = process.env.XDG_CONFIG_HOME;
+	const baseDir = xdgConfig || join(homedir(), '.config');
+	return join(baseDir, 'orbit', 'names.json');
+}
+
+// Session filename patterns - single source of truth
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AGENT_PATTERN = /^agent-([a-f0-9]{7,})$/i;
+
+/**
+ * Check if a filename is a valid session file.
+ * Matches: {UUID}.jsonl or agent-{hex}.jsonl (pure hex ID, 7+ chars)
+ */
+export function isValidSessionFilename(filename: string): boolean {
+	const nameWithoutExt = filename.replace(/\.jsonl$/, '');
+	return UUID_PATTERN.test(nameWithoutExt) || AGENT_PATTERN.test(nameWithoutExt);
+}
+
+/**
+ * Check if a session ID is valid (for security validation).
+ * Used before passing IDs to shell commands.
+ */
+export function isValidSessionId(id: string): boolean {
+	if (UUID_PATTERN.test(id)) return true;
+	if (/^[a-f0-9]{7,}$/i.test(id)) return true;
+	return false;
+}
+
+export type SessionChangeListener = (sessions: Session[]) => void;
+
+const NOTIFY_DEBOUNCE_MS = 500;
+const RESUBSCRIBE_DEBOUNCE_MS = 5_000;
 
 export class SessionManager {
 	private config: OrbitConfig;
 	private sessions: Map<string, Session> = new Map();
-	private watcher: FSWatcher | null = null;
-	private buffer = new EventBuffer();
-	private refreshTimer: ReturnType<typeof setInterval> | null = null;
+	private sessionNames: Map<string, string> = new Map();
+	private watcher: DirectoryWatcher | null = null;
+	private listeners: Set<SessionChangeListener> = new Set();
+	private notifyTimer: ReturnType<typeof setTimeout> | null = null;
+	private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
 
 	constructor(config?: OrbitConfig) {
 		this.config = config ?? getConfig();
+		this.loadSessionNames();
 	}
 
 	/**
-	 * Initialize session list using getNewestNFiles.
+	 * Initialize session list using filtered discovery.
+	 * Only called at startup - uses mtime-based sorting.
 	 */
 	initialize(): void {
 		const files = getNewestNFiles(this.config.sessions.watchPath, this.config.sessions.count, {
 			extension: '.jsonl',
+			matchFilename: isValidSessionFilename,
 		});
+
+		// Reverse to insert oldest→newest (Map preserves insertion order)
+		// Runtime events use delete+set to move to end, so newest must be at end
+		files.reverse();
 
 		this.sessions.clear();
 		for (const file of files) {
@@ -46,70 +95,292 @@ export class SessionManager {
 
 	/**
 	 * Start watching for file changes.
+	 * Events trigger incremental updates - no full rescans.
 	 */
-	startWatcher(): void {
+	async startWatcher(): Promise<void> {
 		if (this.watcher) {
 			return;
 		}
 
-		this.watcher = createWatcher(this.config.sessions.watchPath, (filePath) => {
-			if (filePath.endsWith('.jsonl')) {
-				this.buffer.push(filePath);
-			}
+		this.watcher = await createWatcher(this.config.sessions.watchPath, (filePath) => {
+			this.handleFileEvent(filePath);
 		});
-
-		// Start periodic refresh
-		if (this.config.sessions.refreshIntervalMs > 0) {
-			this.refreshTimer = setInterval(() => {
-				this.refresh();
-			}, this.config.sessions.refreshIntervalMs);
-		}
 	}
 
 	/**
 	 * Stop the watcher and cleanup.
 	 */
-	stopWatcher(): void {
+	async stopWatcher(): Promise<void> {
 		if (this.watcher) {
-			this.watcher.close();
+			await this.watcher.close();
 			this.watcher = null;
 		}
-		if (this.refreshTimer) {
-			clearInterval(this.refreshTimer);
-			this.refreshTimer = null;
+		if (this.notifyTimer) {
+			clearTimeout(this.notifyTimer);
+			this.notifyTimer = null;
+		}
+		if (this.resubscribeTimer) {
+			clearTimeout(this.resubscribeTimer);
+			this.resubscribeTimer = null;
 		}
 	}
 
 	/**
-	 * Consume buffer events and update session list.
-	 * Re-discovers to ensure proper sorting by mtime.
+	 * Handle a file change event - incremental update.
+	 * Handles .jsonl file modifications/deletions and directory creation.
 	 */
-	refresh(): void {
-		const changedPaths = this.buffer.consume();
+	private handleFileEvent(filePath: string): void {
+		const filename = basename(filePath);
 
-		if (changedPaths.length === 0) {
+		if (filename.endsWith('.jsonl')) {
+			this.handleJsonlEvent(filePath, filename);
 			return;
 		}
 
-		// Re-run discovery to get properly sorted list
-		this.initialize();
+		// @parcel/watcher misses subdirectories created via recursive mkdir.
+		// When a new directory appears, scan it for session files and re-subscribe
+		// so future events in the new subtree are detected.
+		try {
+			if (lstatSync(filePath).isDirectory()) {
+				this.handleNewDirectory(filePath);
+			}
+		} catch {
+			// Path vanished or permission denied
+		}
+	}
+
+	private handleJsonlEvent(filePath: string, filename: string): void {
+		if (!isValidSessionFilename(filename)) return;
+
+		// Check if file still exists (handles deletion via 'rename' event)
+		if (!existsSync(filePath)) {
+			const nameWithoutExt = filename.replace(/\.jsonl$/, '');
+			let sessionId: string | null = null;
+
+			if (UUID_PATTERN.test(nameWithoutExt)) {
+				sessionId = nameWithoutExt;
+			} else {
+				const match = nameWithoutExt.match(AGENT_PATTERN);
+				if (match) {
+					sessionId = match[1];
+				}
+			}
+
+			if (sessionId && this.sessions.has(sessionId)) {
+				this.sessions.delete(sessionId);
+				this.scheduleNotify();
+			}
+			return;
+		}
+
+		const eventTime = Date.now();
+		const session = this.fileToSession(filePath, eventTime);
+		if (!session) return;
+
+		// Move to end of Map (newest) - delete + set preserves insertion order
+		this.sessions.delete(session.id);
+		this.sessions.set(session.id, session);
+
+		this.trimSessions();
+		this.scheduleNotify();
+	}
+
+	/**
+	 * Scan a newly created directory for session files.
+	 * Then re-subscribe the watcher so future events in it are detected.
+	 */
+	private handleNewDirectory(dirPath: string): void {
+		let changed = false;
+
+		try {
+			const entries = readdirSync(dirPath, {
+				recursive: true,
+				withFileTypes: true,
+			}) as Dirent[];
+
+			for (const entry of entries) {
+				if (!entry.isFile()) continue;
+				if (!entry.name.endsWith('.jsonl')) continue;
+				if (!isValidSessionFilename(entry.name)) continue;
+
+				const parentPath = entry.parentPath ?? (entry as unknown as { path: string }).path;
+				const fullPath = join(parentPath, entry.name);
+
+				try {
+					const stat = lstatSync(fullPath);
+					const session = this.fileToSession(fullPath, stat.mtimeMs);
+					if (!session) continue;
+
+					this.sessions.delete(session.id);
+					this.sessions.set(session.id, session);
+					changed = true;
+				} catch {
+					// File vanished between readdir and stat
+				}
+			}
+		} catch {
+			// Directory vanished or permission denied
+		}
+
+		if (changed) {
+			this.trimSessions();
+			this.scheduleNotify();
+		}
+
+		this.scheduleResubscribe();
+	}
+
+	private trimSessions(): void {
+		while (this.sessions.size > this.config.sessions.count) {
+			const oldest = this.sessions.keys().next().value;
+			if (oldest) {
+				this.sessions.delete(oldest);
+			}
+		}
+	}
+
+	/**
+	 * Debounced watcher re-subscribe to pick up new subdirectories.
+	 * Creates new subscription before closing old one (zero event gap).
+	 */
+	private scheduleResubscribe(): void {
+		if (this.resubscribeTimer) return;
+		this.resubscribeTimer = setTimeout(async () => {
+			this.resubscribeTimer = null;
+			if (!this.watcher) return;
+			try {
+				// Must close before re-subscribing — @parcel/watcher doesn't
+				// set up inotify watches correctly with two concurrent subscriptions
+				await this.watcher.close();
+				this.watcher = await createWatcher(this.config.sessions.watchPath, (fp) =>
+					this.handleFileEvent(fp),
+				);
+			} catch {
+				// Re-subscribe failed — try to restore watcher
+				try {
+					this.watcher = await createWatcher(this.config.sessions.watchPath, (fp) =>
+						this.handleFileEvent(fp),
+					);
+				} catch {
+					this.watcher = null;
+				}
+			}
+		}, RESUBSCRIBE_DEBOUNCE_MS);
 	}
 
 	/**
 	 * Get all tracked sessions, sorted by lastSeen descending.
-	 * Excludes empty sessions (size === 0).
+	 * Includes session names if set.
 	 */
 	getSessions(): Session[] {
+		// Map is ordered oldest→newest, so reverse for display
 		return Array.from(this.sessions.values())
-			.filter((s) => s.size > 0)
-			.sort((a, b) => b.lastSeen - a.lastSeen);
+			.reverse()
+			.map((session) => {
+				const name = this.sessionNames.get(session.id);
+				return name ? { ...session, name } : session;
+			});
 	}
 
 	/**
 	 * Get a specific session by ID.
 	 */
 	getSession(id: string): Session | undefined {
-		return this.sessions.get(id);
+		const session = this.sessions.get(id);
+		if (session) {
+			const name = this.sessionNames.get(id);
+			if (name) {
+				return { ...session, name };
+			}
+		}
+		return session;
+	}
+
+	/**
+	 * Set the display name for a session.
+	 * Notifies listeners of the change.
+	 */
+	setSessionName(id: string, name: string): boolean {
+		if (!this.sessions.has(id)) {
+			return false;
+		}
+		this.sessionNames.set(id, name);
+		this.saveSessionNames();
+		this.scheduleNotify();
+		return true;
+	}
+
+	/**
+	 * Get the display name for a session.
+	 */
+	getSessionName(id: string): string | undefined {
+		return this.sessionNames.get(id);
+	}
+
+	/**
+	 * Subscribe to session list changes.
+	 * Returns unsubscribe function.
+	 */
+	onChange(listener: SessionChangeListener): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	private loadSessionNames(): void {
+		const path = getSessionNamesPath();
+		if (!existsSync(path)) return;
+		try {
+			const data = JSON.parse(readFileSync(path, 'utf-8'));
+			for (const [id, name] of Object.entries(data)) {
+				if (typeof name === 'string') {
+					this.sessionNames.set(id, name);
+				}
+			}
+		} catch {
+			// Corrupted file — start fresh
+		}
+	}
+
+	private saveSessionNames(): void {
+		const path = getSessionNamesPath();
+		const dir = dirname(path);
+		if (!existsSync(dir)) {
+			mkdirSync(dir, { recursive: true });
+		}
+		const data: Record<string, string> = {};
+		for (const [id, name] of this.sessionNames) {
+			data[id] = name;
+		}
+		const tmpPath = `${path}.tmp`;
+		writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+		renameSync(tmpPath, path);
+	}
+
+	/**
+	 * Schedule debounced notification to listeners.
+	 */
+	private scheduleNotify(): void {
+		if (this.notifyTimer) {
+			clearTimeout(this.notifyTimer);
+		}
+		this.notifyTimer = setTimeout(() => {
+			this.notifyTimer = null;
+			this.notifyListeners();
+		}, NOTIFY_DEBOUNCE_MS);
+	}
+
+	/**
+	 * Notify all listeners of session list change.
+	 */
+	private notifyListeners(): void {
+		const sessions = this.getSessions();
+		for (const listener of this.listeners) {
+			try {
+				listener(sessions);
+			} catch {
+				// Listener error shouldn't break others
+			}
+		}
 	}
 
 	/**
@@ -122,11 +393,11 @@ export class SessionManager {
 		let id: string;
 		let type: SessionType;
 
-		if (UUID_REGEX.test(nameWithoutExt)) {
+		if (UUID_PATTERN.test(nameWithoutExt)) {
 			id = nameWithoutExt;
 			type = 'session';
 		} else {
-			const match = filename.match(AGENT_ID_REGEX);
+			const match = nameWithoutExt.match(AGENT_PATTERN);
 			if (match) {
 				id = match[1];
 				type = 'agent';
@@ -135,17 +406,8 @@ export class SessionManager {
 			}
 		}
 
-		// Get file size
-		let size = 0;
-		try {
-			const stat = statSync(path);
-			size = stat.size;
-		} catch {
-			// File may have been deleted
-		}
-
 		const now = Date.now();
-		const active = now - mtimeMs < this.config.sessions.activeThresholdMs;
+		const active = now - mtimeMs < this.config.ui.activeThresholdMs;
 
 		return {
 			id,
@@ -153,7 +415,6 @@ export class SessionManager {
 			type,
 			lastSeen: mtimeMs,
 			mtime: mtimeMs,
-			size,
 			active,
 		};
 	}
@@ -165,6 +426,8 @@ let managerInstance: SessionManager | null = null;
 export function getSessionManager(config?: OrbitConfig): SessionManager {
 	if (!managerInstance) {
 		managerInstance = new SessionManager(config);
+	} else if (config) {
+		console.warn('SessionManager already initialized, config parameter ignored');
 	}
 	return managerInstance;
 }

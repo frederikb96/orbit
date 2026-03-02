@@ -10,47 +10,29 @@
  * - orbit build - Build client bundle
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Command } from 'commander';
 import { getConfig } from './lib/config.ts';
-
-const STATE_DIR = join(homedir(), '.local', 'state', 'orbit');
-const PID_FILE = join(STATE_DIR, 'pid');
-
-function ensureStateDir(): void {
-	if (!existsSync(STATE_DIR)) {
-		mkdirSync(STATE_DIR, { recursive: true });
-	}
-}
-
-function readPid(): number | null {
-	if (!existsSync(PID_FILE)) return null;
-	try {
-		const content = readFileSync(PID_FILE, 'utf-8').trim();
-		const pid = Number.parseInt(content, 10);
-		return Number.isNaN(pid) ? null : pid;
-	} catch {
-		return null;
-	}
-}
-
-function writePid(pid: number): void {
-	ensureStateDir();
-	writeFileSync(PID_FILE, String(pid));
-}
-
-function removePid(): void {
-	if (existsSync(PID_FILE)) {
-		unlinkSync(PID_FILE);
-	}
-}
+import { readPid, removePid } from './shared/state.ts';
 
 function isProcessRunning(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function isSystemdActive(): Promise<boolean> {
+	try {
+		const proc = Bun.spawn(['systemctl', '--user', 'is-active', 'orbit.service'], {
+			stdout: 'pipe',
+			stderr: 'pipe',
+		});
+		const output = await new Response(proc.stdout).text();
+		await proc.exited;
+		return output.trim() === 'active';
 	} catch {
 		return false;
 	}
@@ -77,6 +59,7 @@ program
 	.command('start')
 	.description('Start the Orbit server daemon')
 	.option('-p, --port <port>', 'Port to listen on')
+	.option('--foreground', 'Run in foreground (for systemd)')
 	.action(async (options) => {
 		const existingPid = readPid();
 		if (existingPid && isProcessRunning(existingPid)) {
@@ -87,7 +70,21 @@ program
 		const config = getConfig();
 		const port = options.port ? Number.parseInt(options.port, 10) : config.server.port;
 
-		// Start server as daemon using setsid for proper detaching + systemd-cat for logging
+		if (options.foreground) {
+			process.env.ORBIT_PORT = String(port);
+			const { startServer } = await import('./server/index.ts');
+			const server = await startServer();
+
+			const shutdown = async () => {
+				await server.stop();
+				process.exit(0);
+			};
+			process.on('SIGTERM', shutdown);
+			process.on('SIGINT', shutdown);
+			return;
+		}
+
+		// Daemon mode: spawn detached process with journald logging
 		const serverPath = join(dirname(import.meta.path), 'server', 'index.ts');
 
 		const proc = Bun.spawn(['setsid', 'systemd-cat', '-t', 'orbit', 'bun', 'run', serverPath], {
@@ -98,27 +95,30 @@ program
 			stdio: ['ignore', 'ignore', 'ignore'],
 		});
 
-		// Unref so the parent doesn't wait for the child
 		proc.unref();
 
-		// Wait for health check to confirm server is up
 		const healthy = await healthCheck(port);
 		if (!healthy) {
 			console.error('Failed to start Orbit server');
 			process.exit(1);
 		}
 
-		// Write PID file - use the spawned process PID
-		writePid(proc.pid);
-
-		console.log(`Orbit started on http://localhost:${port} (PID: ${proc.pid})`);
+		const serverPid = readPid();
+		console.log(
+			`Orbit started on http://localhost:${port}${serverPid ? ` (PID: ${serverPid})` : ''}`,
+		);
 		process.exit(0);
 	});
 
 program
 	.command('stop')
 	.description('Stop the Orbit server daemon')
-	.action(() => {
+	.action(async () => {
+		if (await isSystemdActive()) {
+			console.log('Orbit is managed by systemd. Use: systemctl --user stop orbit');
+			process.exit(1);
+		}
+
 		const pid = readPid();
 		if (!pid) {
 			console.log('Orbit is not running');
@@ -144,16 +144,23 @@ program
 program
 	.command('status')
 	.description('Check if Orbit is running')
-	.action(() => {
+	.action(async () => {
 		const pid = readPid();
+		const systemd = await isSystemdActive();
+
 		if (!pid) {
+			if (systemd) {
+				console.log('Orbit is running via systemd');
+				process.exit(0);
+			}
 			console.log('Orbit is not running');
 			process.exit(1);
 		}
 
 		if (isProcessRunning(pid)) {
 			const config = getConfig();
-			console.log(`Orbit is running (PID: ${pid}, port: ${config.server.port})`);
+			const mode = systemd ? 'systemd' : 'daemon';
+			console.log(`Orbit is running (PID: ${pid}, port: ${config.server.port}, ${mode})`);
 			process.exit(0);
 		}
 
@@ -166,8 +173,11 @@ program
 	.command('logs')
 	.description('View Orbit logs')
 	.option('-f, --follow', 'Follow log output')
-	.action((options) => {
-		const args = ['journalctl', '-t', 'orbit', '--output=cat'];
+	.action(async (options) => {
+		const systemd = await isSystemdActive();
+		const args = systemd
+			? ['journalctl', '--user', '-u', 'orbit.service', '--output=cat']
+			: ['journalctl', '-t', 'orbit', '--output=cat'];
 		if (options.follow) {
 			args.push('-f');
 		}
@@ -176,7 +186,6 @@ program
 			stdio: ['inherit', 'inherit', 'inherit'],
 		});
 
-		// Wait for the process to exit
 		proc.exited.then((code) => {
 			process.exit(code ?? 0);
 		});

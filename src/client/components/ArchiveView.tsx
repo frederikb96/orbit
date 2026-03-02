@@ -16,41 +16,35 @@ import { CopyButton } from './CopyButton.tsx';
 import { LazyDiffView } from './LazyDiffView.tsx';
 import { Markdown } from './Markdown.tsx';
 
+// Threshold for showing "Back to Live" floating indicator
+const NEAR_BOTTOM_THRESHOLD = 500;
+
 // Fractional item size measurement for sub-pixel accuracy
 function fractionalItemSize(element: HTMLElement) {
 	return element.getBoundingClientRect().height;
 }
 
-// Large offset for stable prepending (Virtuoso pattern)
-const PREPEND_OFFSET = 10_000_000;
-
-// Context passed to Virtuoso - allows us to control index-to-item mapping
-// instead of letting Virtuoso manage it via data prop (which breaks on prepend)
-type VirtuosoContext = {
-	displayEntries: ParsedEntry[];
-	numPrepended: number;
-};
-
-// Calculate real array index from Virtuoso's virtual index
-// When items prepend, firstItemIndex decreases, so virtuosoIndex + numPrepended
-// maps back to the correct position in the actual array
-function calculateItemIndex(virtuosoIndex: number, numPrepended: number): number {
-	return virtuosoIndex + numPrepended - PREPEND_OFFSET;
-}
-
 // Item wrapper traps CSS margins, preventing measurement errors
-// Using VirtuosoContext as the second generic type parameter
 const VirtuosoItem = React.forwardRef<HTMLDivElement, ItemProps<unknown>>((props, ref) => (
 	<div {...props} ref={ref} style={{ display: 'inline-block', width: '100%' }} />
 ));
 
-interface TranscriptViewProps {
+export interface ArchiveViewProps {
 	session: Session;
 	sessionTitle: string | null;
+	snapshotTimestamp: string;
 	entries: ParsedEntry[];
+	isLoading: boolean;
+	loadingProgress: number;
+	hasMore: boolean;
+	newEntriesCount: number;
 	tokens: TokenStats | null;
-	transcriptLoading: boolean;
-	onReload: () => void;
+	totalCount?: number; // Row 32: Total entries for progress calculation
+	memoryWarning?: boolean; // Row 33: True if memory limit was hit
+	firstItemIndex: number; // Row 13: Virtual index for prepended content
+	onLoadMore: () => void;
+	onRefresh: () => void;
+	onSwitchToLive: () => void;
 	expandThinking: boolean | null;
 	expandRead: boolean | null;
 	expandEdit: boolean | null;
@@ -59,20 +53,24 @@ interface TranscriptViewProps {
 	onToggleExpandRead: () => void;
 	onToggleExpandEdit: () => void;
 	onToggleExpandOther: () => void;
-	// Windowed loading
-	hasMore: boolean;
-	isLoadingOlder: boolean;
-	numPrepended: number;
-	onLoadOlder: () => void;
 }
 
-export function TranscriptView({
+export function ArchiveView({
 	session,
 	sessionTitle,
+	snapshotTimestamp,
 	entries,
+	isLoading,
+	loadingProgress,
+	hasMore,
+	newEntriesCount,
 	tokens,
-	transcriptLoading,
-	onReload,
+	totalCount,
+	memoryWarning = false,
+	firstItemIndex,
+	onLoadMore,
+	onRefresh,
+	onSwitchToLive,
 	expandThinking,
 	expandRead,
 	expandEdit,
@@ -81,16 +79,40 @@ export function TranscriptView({
 	onToggleExpandRead,
 	onToggleExpandEdit,
 	onToggleExpandOther,
-	hasMore,
-	isLoadingOlder,
-	numPrepended,
-	onLoadOlder,
-}: TranscriptViewProps) {
+}: ArchiveViewProps) {
 	const { config } = useConfig();
 	const virtuosoRef = useRef<VirtuosoHandle>(null);
+	const [isPaused, setIsPaused] = useState(false);
 	const isAtBottomRef = useRef(true);
-	const [shouldAutoscroll, setShouldAutoscroll] = useState(true);
-	const [hasNewEntries, setHasNewEntries] = useState(false);
+	const isInitialScrollDone = useRef(false);
+	const prevEntriesLength = useRef(0);
+
+	// Near-bottom detection for floating "Back to Live" indicator
+	const [showBackToLive, setShowBackToLive] = useState(false);
+	const scrollListenerCleanupRef = useRef<(() => void) | null>(null);
+	const scrollerElRef = useRef<HTMLElement | null>(null);
+
+	const handleScrollerRef = useCallback((el: HTMLElement | Window | null) => {
+		scrollListenerCleanupRef.current?.();
+		scrollListenerCleanupRef.current = null;
+		if (!(el instanceof HTMLElement)) {
+			scrollerElRef.current = null;
+			return;
+		}
+		scrollerElRef.current = el;
+		const onScroll = () => {
+			const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_THRESHOLD;
+			setShowBackToLive(nearBottom);
+		};
+		el.addEventListener('scroll', onScroll, { passive: true });
+		scrollListenerCleanupRef.current = () => el.removeEventListener('scroll', onScroll);
+		requestAnimationFrame(onScroll);
+	}, []);
+
+	// Anchor preservation for refresh
+	const [anchorEntryId, setAnchorEntryId] = useState<string | null>(null);
+	const pendingAnchorRestore = useRef(false);
+	const visibleStartIndexRef = useRef(0);
 
 	// Effective expand states (null means use config default)
 	const effectiveExpandThinking = expandThinking ?? config.defaultExpandThinking;
@@ -110,8 +132,6 @@ export function TranscriptView({
 	);
 
 	// Build tool result map for inline display via getToolResult()
-	// Tool results are never displayed as separate entries - they appear inline in ToolCallBlock
-	// This makes displayEntries strictly append-only (critical for Virtuoso stability)
 	const toolResultMapRef = useRef<Map<string, ParsedToolResult>>(new Map());
 	const displayEntries = useMemo(() => {
 		const resultMap = new Map<string, ParsedToolResult>();
@@ -134,175 +154,198 @@ export function TranscriptView({
 		[],
 	);
 
-	// Track if this is the initial load for a session
-	const isInitialLoadRef = useRef(true);
-
-	// NOTE: Removed manual scroll adjustment - testing if Virtuoso's native
-	// firstItemIndex handling works correctly when we don't interfere
-
-	// Reset state on session change
-	// biome-ignore lint/correctness/useExhaustiveDependencies: session.id intentionally triggers reset
+	// Scroll to end on initial load (Row 13: use virtual index)
 	useEffect(() => {
-		setShouldAutoscroll(true);
-		setHasNewEntries(false);
-		isAtBottomRef.current = true;
-		isInitialLoadRef.current = true;
-	}, [session.id]);
-
-	// Scroll to bottom when entries first load for a new session
-	useEffect(() => {
-		if (isInitialLoadRef.current && displayEntries.length > 0 && virtuosoRef.current) {
-			isInitialLoadRef.current = false;
-			// Small delay to let Virtuoso finish rendering
+		if (!isInitialScrollDone.current && displayEntries.length > 0 && virtuosoRef.current) {
+			isInitialScrollDone.current = true;
 			setTimeout(() => {
 				virtuosoRef.current?.scrollToIndex({
-					index: displayEntries.length - 1,
+					index: firstItemIndex + displayEntries.length - 1,
 					align: 'end',
 					behavior: 'auto',
 				});
 			}, 50);
 		}
-	}, [displayEntries.length]);
+	}, [displayEntries.length, firstItemIndex]);
 
-	// Track at-bottom state for auto-scroll decisions
+	// Reset initial scroll flag on session change
+	// biome-ignore lint/correctness/useExhaustiveDependencies: session.id intentionally triggers reset
+	useEffect(() => {
+		isInitialScrollDone.current = false;
+		isAtBottomRef.current = true;
+		prevEntriesLength.current = 0;
+		setIsPaused(false);
+		setAnchorEntryId(null);
+		pendingAnchorRestore.current = false;
+	}, [session.id]);
+
+	// Restore anchor position after refresh completes (Row 13: use virtual index)
+	useEffect(() => {
+		if (!pendingAnchorRestore.current || !anchorEntryId || displayEntries.length === 0) return;
+
+		const anchorIndex = displayEntries.findIndex((e) => e.id === anchorEntryId);
+		if (anchorIndex >= 0) {
+			virtuosoRef.current?.scrollToIndex({
+				index: firstItemIndex + anchorIndex,
+				align: 'start',
+				behavior: 'auto',
+			});
+		}
+		pendingAnchorRestore.current = false;
+		setAnchorEntryId(null);
+	}, [displayEntries, anchorEntryId, firstItemIndex]);
+
+	// Capture anchor before refresh and trigger onRefresh
+	// Row 13: visibleStartIndexRef is a virtual index, convert to array index
+	const handleRefreshWithAnchor = useCallback(() => {
+		// Capture the first visible entry ID as anchor using tracked range
+		if (displayEntries.length > 0) {
+			const virtualTopIndex = visibleStartIndexRef.current;
+			const arrayIndex = virtualTopIndex - firstItemIndex;
+			const topEntry = displayEntries[arrayIndex];
+			if (topEntry) {
+				setAnchorEntryId(topEntry.id);
+				pendingAnchorRestore.current = true;
+			}
+		}
+		onRefresh();
+	}, [displayEntries, onRefresh, firstItemIndex]);
+
+	// Pause/resume progressive loading based on scroll position
 	const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
 		isAtBottomRef.current = atBottom;
-		if (atBottom) {
-			setHasNewEntries(false);
-			setShouldAutoscroll(true);
-		}
+		setIsPaused(!atBottom);
 	}, []);
 
-	// Load older entries when at top (stream-chat-react pattern)
-	// Uses atTopStateChange instead of startReached for more reliable triggering
-	const handleAtTopStateChange = useCallback(
-		(isAtTop: boolean) => {
-			if (isAtTop && hasMore && !isLoadingOlder) {
-				onLoadOlder();
-			}
+	// Track visible range to detect if user scrolled up and capture anchor position
+	// Row 13: range indices are virtual, so compare against virtual end index
+	const handleRangeChange = useCallback(
+		(range: { startIndex: number; endIndex: number }) => {
+			visibleStartIndexRef.current = range.startIndex;
+			const virtualEndIndex = firstItemIndex + displayEntries.length - 1;
+			const atBottom = range.endIndex >= virtualEndIndex - 5;
+			setIsPaused(!atBottom);
 		},
-		[hasMore, isLoadingOlder, onLoadOlder],
+		[displayEntries.length, firstItemIndex],
 	);
 
-	// Virtuoso followOutput: auto-scroll when at bottom
-	// Uses 'auto' (instant scroll) instead of 'smooth' for high-throughput SSE updates
-	// to prevent visible animation causing layout shifts
-	const followOutput = useCallback(
-		(isAtBottom: boolean) => {
-			if (!shouldAutoscroll) return false;
-			if (!isAtBottom) {
-				setHasNewEntries(true);
-				return false;
-			}
-			return 'auto';
-		},
-		[shouldAutoscroll],
-	);
-
-	// Manual autoscroll toggle (for button click)
-	const handleAutoscrollToggle = useCallback(() => {
-		const newValue = !shouldAutoscroll;
-		setShouldAutoscroll(newValue);
-		if (newValue && virtuosoRef.current && displayEntries.length > 0) {
-			virtuosoRef.current.scrollToIndex({
-				index: displayEntries.length - 1,
-				behavior: 'smooth',
-			});
-			setHasNewEntries(false);
+	// Progressive loading: load more when at bottom and has more
+	useEffect(() => {
+		if (hasMore && !isPaused && !isLoading) {
+			onLoadMore();
 		}
-	}, [shouldAutoscroll, displayEntries.length]);
+	}, [hasMore, isPaused, isLoading, onLoadMore]);
 
-	// Enable autoscroll and scroll to bottom (for keyboard shortcut)
-	const handleAutoscrollEnable = useCallback(() => {
-		setShouldAutoscroll(true);
-		setHasNewEntries(false);
-		if (virtuosoRef.current && displayEntries.length > 0) {
-			virtuosoRef.current.scrollToIndex({
-				index: displayEntries.length - 1,
-				behavior: 'smooth',
-			});
+	// Snap to bottom after progressive loading adds content (Row 13: use virtual index)
+	useEffect(() => {
+		const currentLength = displayEntries.length;
+		const hadNewEntries = currentLength > prevEntriesLength.current;
+		prevEntriesLength.current = currentLength;
+
+		// Only snap to bottom if user is CURRENTLY at bottom (not where they were when loading started)
+		if (hadNewEntries && isAtBottomRef.current && currentLength > 0) {
+			// Small delay to let Virtuoso measure the new content
+			setTimeout(() => {
+				virtuosoRef.current?.scrollToIndex({
+					index: firstItemIndex + currentLength - 1,
+					align: 'end',
+					behavior: 'auto',
+				});
+			}, 50);
 		}
-	}, [displayEntries.length]);
+	}, [displayEntries.length, firstItemIndex]);
 
-	// Jump to newest entries (floating button)
-	const handleJumpToLatest = useCallback(() => {
-		if (virtuosoRef.current && displayEntries.length > 0) {
-			virtuosoRef.current.scrollToIndex({
-				index: displayEntries.length - 1,
-				behavior: 'smooth',
-			});
-		}
-		setHasNewEntries(false);
-		setShouldAutoscroll(true);
-	}, [displayEntries.length]);
-
-	const handleReload = useCallback(() => {
-		setShouldAutoscroll(true);
-		setHasNewEntries(false);
-		isAtBottomRef.current = true;
-		onReload();
-	}, [onReload]);
-
-	// Keyboard shortcuts (transcript-specific)
+	// Keyboard navigation: Home/End/PageUp/PageDown for transcript scrolling
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
-			if (!e.shiftKey || !e.altKey) return;
+			if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+			if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
 
-			switch (e.key.toLowerCase()) {
-				case 's':
+			switch (e.key) {
+				case 'Home':
 					e.preventDefault();
-					handleAutoscrollEnable();
+					virtuosoRef.current?.scrollToIndex({
+						index: firstItemIndex,
+						align: 'start',
+						behavior: 'auto',
+					});
 					break;
-				case 'r':
+				case 'End':
 					e.preventDefault();
-					handleReload();
+					virtuosoRef.current?.scrollToIndex({
+						index: firstItemIndex + displayEntries.length - 1,
+						align: 'end',
+						behavior: 'auto',
+					});
+					break;
+				case 'PageUp':
+					e.preventDefault();
+					if (scrollerElRef.current) {
+						scrollerElRef.current.scrollTo({
+							top: scrollerElRef.current.scrollTop - scrollerElRef.current.clientHeight,
+							behavior: 'smooth',
+						});
+					}
+					break;
+				case 'PageDown':
+					e.preventDefault();
+					if (scrollerElRef.current) {
+						scrollerElRef.current.scrollTo({
+							top: scrollerElRef.current.scrollTop + scrollerElRef.current.clientHeight,
+							behavior: 'smooth',
+						});
+					}
 					break;
 			}
 		};
 
 		window.addEventListener('keydown', handleKeyDown);
 		return () => window.removeEventListener('keydown', handleKeyDown);
-	}, [handleAutoscrollEnable, handleReload]);
+	}, [firstItemIndex, displayEntries.length]);
 
-	// Memoized context for Virtuoso - changes when entries or numPrepended change
-	const virtuosoContext = useMemo<VirtuosoContext>(
-		() => ({ displayEntries, numPrepended }),
-		[displayEntries, numPrepended],
-	);
+	// Scroll to bottom within Archive (for new entries badge) (Row 13: use virtual index)
+	const handleScrollToBottom = useCallback(() => {
+		virtuosoRef.current?.scrollToIndex({
+			index: firstItemIndex + displayEntries.length - 1,
+			align: 'end',
+			behavior: 'smooth',
+		});
+	}, [displayEntries.length, firstItemIndex]);
 
-	// Compute stable key from entry ID using context
-	// We control the index-to-item mapping, not Virtuoso
+	// Compute stable key from entry ID (Row 13: account for firstItemIndex offset)
 	const computeItemKey = useCallback(
-		(virtuosoIndex: number, _data: unknown, context: VirtuosoContext) => {
-			const realIndex = calculateItemIndex(virtuosoIndex, context.numPrepended);
-			const entry = context.displayEntries[realIndex];
-			return entry?.id ?? `fallback-${virtuosoIndex}`;
+		(index: number) => {
+			const entry = displayEntries[index - firstItemIndex];
+			return entry?.id ?? `fallback-${index}`;
 		},
-		[],
+		[displayEntries, firstItemIndex],
 	);
 
-	// Render function for Virtuoso - uses context to map virtuosoIndex to real entry
-	// This is the key pattern from stream-chat-react: we control the mapping
+	// Render function for Virtuoso (Row 13: account for firstItemIndex offset)
 	const itemContent = useCallback(
-		(virtuosoIndex: number, _data: unknown, context: VirtuosoContext) => {
-			const realIndex = calculateItemIndex(virtuosoIndex, context.numPrepended);
-			const entry = context.displayEntries[realIndex];
+		(index: number) => {
+			const entry = displayEntries[index - firstItemIndex];
 			if (!entry) return <div style={{ height: '1px' }} />;
-			return <MemoizedEntryCard entry={entry} entriesCount={context.displayEntries.length} />;
+			return <MemoizedEntryCard entry={entry} entriesCount={displayEntries.length} />;
 		},
-		[],
+		[displayEntries, firstItemIndex],
 	);
 
 	return (
-		<div className="transcript-view">
+		<div className="transcript-view archive-view-container">
 			<header className="transcript-header">
 				<div className="header-info">
-					<span className="session-type-badge">{session.type}</span>
+					<span className="session-type-badge">ARCHIVE</span>
 					{sessionTitle && <span className="session-title">{sessionTitle}</span>}
 					<span className="session-id">{session.id}</span>
-					{Date.now() - session.mtime < config.activeThresholdMs && (
-						<span className="active-badge">&#x26A1; Active</span>
-					)}
+					<span className="snapshot-timestamp" title={`Snapshot from ${snapshotTimestamp}`}>
+						Frozen: {formatTime(snapshotTimestamp)}
+					</span>
+					<span className="entry-count-indicator">
+						{displayEntries.length} entries
+						{hasMore && ' (loading...)'}
+						{memoryWarning && ' (truncated)'}
+					</span>
 				</div>
 				{tokens && (
 					<div className="token-stats">
@@ -349,57 +392,77 @@ export function TranscriptView({
 				<button
 					type="button"
 					className="reload-btn"
-					onClick={handleReload}
-					title="Reload transcript (Shift+Alt+R)"
+					onClick={handleRefreshWithAnchor}
+					title="Refresh archive snapshot (Shift+Alt+R)"
 				>
 					&#x1F504;
 				</button>
 				<button
 					type="button"
-					className={`auto-scroll-btn ${shouldAutoscroll ? 'active' : ''}`}
-					onClick={handleAutoscrollToggle}
-					title={`Auto-scroll ${shouldAutoscroll ? 'ON' : 'OFF'} (Shift+Alt+S to enable)`}
+					className="auto-scroll-btn"
+					onClick={onSwitchToLive}
+					title="Switch to Live mode (Shift+Alt+H)"
 				>
-					{shouldAutoscroll ? '\u2193' : '\u23F8'}
+					&#x26A1;
 				</button>
 			</header>
 
+			{/* Row 33: Memory warning banner */}
+			{memoryWarning && (
+				<div className="memory-warning-banner">
+					Archive truncated to prevent memory issues. Showing last {displayEntries.length} entries.
+				</div>
+			)}
+
 			<div className="entries-container">
-				{transcriptLoading ? (
-					<div className="loading-entries">Loading transcript...</div>
+				{isLoading && displayEntries.length === 0 ? (
+					<div className="archive-loading-overlay">
+						<div className="spinner" />
+						{/* Row 32: Enhanced loading progress */}
+						<div className="archive-progress">
+							{totalCount && totalCount > 0
+								? `Loading history... ${loadingProgress}% (${entries.length}/${totalCount} entries)`
+								: `Loading history... ${loadingProgress}%`}
+						</div>
+					</div>
 				) : displayEntries.length === 0 ? (
 					<div className="empty-transcript">No entries in this transcript</div>
 				) : (
 					<EntryProvider expandState={expandState} getToolResult={getToolResult}>
-						<Virtuoso<unknown, VirtuosoContext>
+						<Virtuoso
 							key={session.id}
 							ref={virtuosoRef}
-							// totalCount + context pattern: we control index-to-item mapping
-							// instead of letting Virtuoso manage it via data prop
-							totalCount={displayEntries.length}
-							context={virtuosoContext}
+							scrollerRef={handleScrollerRef}
+							data={displayEntries}
+							firstItemIndex={firstItemIndex}
 							computeItemKey={computeItemKey}
 							itemContent={itemContent}
 							itemSize={fractionalItemSize}
-							firstItemIndex={PREPEND_OFFSET - numPrepended}
-							followOutput={followOutput}
+							initialTopMostItemIndex={firstItemIndex + displayEntries.length - 1}
+							followOutput={false}
 							atBottomStateChange={handleAtBottomStateChange}
 							atBottomThreshold={100}
-							atTopStateChange={handleAtTopStateChange}
-							increaseViewportBy={{ top: 0, bottom: 200 }}
+							rangeChanged={handleRangeChange}
+							increaseViewportBy={{ top: 200, bottom: 200 }}
 							style={{ height: '100%' }}
 							components={{
 								Item: VirtuosoItem,
 								Header: () => {
-									// Fixed height to prevent layout shifts when loading state changes
-									const showContent = isLoadingOlder || hasMore;
+									if (!hasMore && !isLoading) return null;
 									return (
-										<div style={{ height: showContent ? '40px' : '0px', overflow: 'hidden' }}>
-											{isLoadingOlder && (
-												<div className="loading-older">Loading older entries...</div>
+										<div style={{ height: '40px', overflow: 'hidden' }}>
+											{isLoading && (
+												<div className="loading-older">
+													Loading... {loadingProgress}%
+													{isPaused && ' (paused - scroll to bottom to resume)'}
+												</div>
 											)}
-											{!isLoadingOlder && hasMore && (
-												<div className="has-more-indicator">Scroll up to load more</div>
+											{!isLoading && hasMore && (
+												<div className="has-more-indicator">
+													{isPaused
+														? 'Scroll to bottom to continue loading'
+														: 'Loading more entries...'}
+												</div>
 											)}
 										</div>
 									);
@@ -410,27 +473,26 @@ export function TranscriptView({
 				)}
 			</div>
 
-			{hasNewEntries && (
-				<button type="button" className="new-entries-indicator" onClick={handleJumpToLatest}>
-					New entries &#x2193;
+			{/* Back to Live indicator (floating) - shows when near bottom */}
+			{showBackToLive && (
+				<button type="button" className="back-to-live-indicator" onClick={onSwitchToLive}>
+					&#x26A1; Back to Live &#x2193;
 				</button>
 			)}
-
-			<footer className="transcript-footer">
-				<span className="entry-count">{displayEntries.length} entries</span>
-			</footer>
 		</div>
 	);
 }
 
+// Entry card components - reused from TranscriptView pattern
+
 interface EntryCardProps {
 	entry: ParsedEntry;
-	entriesCount: number; // Busts memo when entries change (tool results arrive)
+	entriesCount: number;
 }
 
 const MemoizedEntryCard = memo(function EntryCard({
 	entry,
-	entriesCount: _entriesCount, // Used to bust memo, not directly
+	entriesCount: _entriesCount,
 }: EntryCardProps) {
 	const { expandState } = useEntryContext();
 
@@ -440,7 +502,6 @@ const MemoizedEntryCard = memo(function EntryCard({
 		case 'assistant':
 			return <MemoizedAssistantEntry entry={entry} />;
 		case 'tool_result':
-			// Tool results are filtered out in displayEntries - this is a safety fallback
 			return <MemoizedToolResultEntry entry={entry} expanded={expandState.other} />;
 		case 'system':
 			return <MemoizedSystemEntry entry={entry} />;
@@ -471,7 +532,6 @@ const MemoizedAssistantEntry = memo(function AssistantEntry({ entry }: Assistant
 
 	return (
 		<>
-			{/* Thinking: separate box */}
 			{entry.thinking && (
 				<details className="entry thinking-entry" open={expandState.thinking}>
 					<summary className="entry-header">
@@ -483,7 +543,6 @@ const MemoizedAssistantEntry = memo(function AssistantEntry({ entry }: Assistant
 				</details>
 			)}
 
-			{/* Assistant text: separate box */}
 			{entry.content && (
 				<div className="entry assistant-entry">
 					<div className="entry-header">
@@ -503,7 +562,6 @@ const MemoizedAssistantEntry = memo(function AssistantEntry({ entry }: Assistant
 				</div>
 			)}
 
-			{/* Tool calls: each is a separate box */}
 			{entry.toolCalls?.map((tool) => {
 				const category = getToolCategory(tool.name);
 				const expandGroup = getExpandGroup(category);
@@ -536,17 +594,16 @@ interface ToolCallBlockProps {
 	timestamp: string;
 }
 
-// Tool category icons
 const TOOL_ICONS: Record<import('../../shared/tools.ts').ToolCategory, string> = {
-	read: '\uD83D\uDCD6', // 📖
-	edit: '\u270F\uFE0F', // ✏️
-	bash: '\uD83D\uDCBB', // 💻
-	search: '\uD83D\uDD0D', // 🔍
-	web: '\uD83C\uDF10', // 🌐
-	task: '\uD83E\uDD16', // 🤖
-	mcp: '\uD83D\uDD0C', // 🔌
-	skill: '\u26A1', // ⚡
-	other: '\uD83D\uDD27', // 🔧
+	read: '\uD83D\uDCD6',
+	edit: '\u270F\uFE0F',
+	bash: '\uD83D\uDCBB',
+	search: '\uD83D\uDD0D',
+	web: '\uD83C\uDF10',
+	task: '\uD83E\uDD16',
+	mcp: '\uD83D\uDD0C',
+	skill: '\u26A1',
+	other: '\uD83D\uDD27',
 };
 
 const MemoizedToolCallBlock = memo(function ToolCallBlock({
@@ -569,12 +626,10 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 	const isWriteTool = tool.name === 'Write';
 	const isFileTool = isReadTool || isEditTool || isWriteTool;
 
-	// For Edit tool, extract old/new strings for diff view
 	const oldString = tool.input?.old_string as string | undefined;
 	const newString = tool.input?.new_string as string | undefined;
 	const hasDiff = isEditTool && oldString !== undefined && newString !== undefined;
 
-	// For Write tool, extract content for syntax-highlighted display
 	const writeContent = tool.input?.content as string | undefined;
 
 	return (
@@ -603,7 +658,6 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 				{/* Tool primary info - skip for file tools (path shown in header) */}
 				{!isFileTool && summary && <div className="tool-summary-body">{summary}</div>}
 
-				{/* Edit tool: show diff view from input */}
 				{hasDiff && (
 					<LazyDiffView
 						oldValue={oldString}
@@ -613,7 +667,6 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 					/>
 				)}
 
-				{/* Write tool: show syntax-highlighted content from input */}
 				{isWriteTool && writeContent && (
 					<CodeBlock
 						code={writeContent}
@@ -623,19 +676,16 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 					/>
 				)}
 
-				{/* Other tools: show details */}
 				{!hasDiff && !isWriteTool && details && <pre className="tool-details">{details}</pre>}
 
-				{/* Edit/Write errors only show error message */}
 				{(hasDiff || isWriteTool) && result?.isError && (
 					<div className="tool-result-error">
 						<pre>{result.content}</pre>
 					</div>
 				)}
 
-				{/* Other tools: show full result */}
 				{!hasDiff && !isWriteTool && result && (
-					<TranscriptReadResultOrGeneric
+					<ArchiveReadResultOrGeneric
 						result={result}
 						isReadTool={isReadTool}
 						isBashTool={isBashTool}
@@ -647,7 +697,7 @@ const MemoizedToolCallBlock = memo(function ToolCallBlock({
 	);
 });
 
-const TranscriptReadResultOrGeneric = memo(function TranscriptReadResultOrGeneric({
+const ArchiveReadResultOrGeneric = memo(function ArchiveReadResultOrGeneric({
 	result,
 	isReadTool,
 	isBashTool,
@@ -663,34 +713,26 @@ const TranscriptReadResultOrGeneric = memo(function TranscriptReadResultOrGeneri
 		[isReadTool, result.content],
 	);
 
-	if (isReadTool && filePath && !result.isError) {
-		return (
-			<div className="read-result">
-				<div className="read-result-header">
+	return (
+		<div className={`tool-result ${result.isError ? 'error' : ''}`}>
+			<div className="result-label">
+				{result.isError ? '\u274C Error' : '\u2713 Result'}
+				{stripped && !result.isError && (
 					<span className="result-meta">
-						{stripped ? `${stripped.lineCount} lines` : 'Result'}
-						{stripped && stripped.startLine > 1 && ` (from line ${stripped.startLine})`}
+						{stripped.lineCount} lines (from line {stripped.startLine})
 					</span>
-					<CopyButton content={result.content} title="Copy result" />
-				</div>
+				)}
+				<CopyButton content={result.content} title="Copy result" />
+			</div>
+			{isReadTool && filePath && !result.isError ? (
 				<CodeBlock
 					code={stripped?.content ?? result.content}
 					filePath={filePath}
 					showLineNumbers={true}
 					startingLineNumber={stripped?.startLine ?? 1}
-					maxHeight="500px"
+					maxHeight="400px"
 				/>
-			</div>
-		);
-	}
-
-	return (
-		<div className={`tool-result ${result.isError ? 'error' : ''}`}>
-			<div className="result-label">
-				{result.isError ? '\u274C Error' : '\u2713 Result'}
-				<CopyButton content={result.content} title="Copy result" />
-			</div>
-			{isBashTool ? (
+			) : isBashTool ? (
 				<AnsiText text={result.content} className="result-content" />
 			) : (
 				<pre className="result-content">{result.content}</pre>

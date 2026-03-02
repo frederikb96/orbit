@@ -201,6 +201,18 @@ export function parseTranscript(content: string): {
 	return { entries, tokens };
 }
 
+// Entry types that produce visible UI entries (everything else is noise: progress, queue-operation, etc.)
+const RENDERABLE_TYPES = new Set(['user', 'assistant', 'system']);
+
+function isRenderableLine(line: string): boolean {
+	try {
+		const parsed = JSON.parse(line);
+		return typeof parsed.type === 'string' && RENDERABLE_TYPES.has(parsed.type);
+	} catch {
+		return false;
+	}
+}
+
 interface LineWithOffset {
 	line: string;
 	byteOffset: number;
@@ -252,10 +264,17 @@ export async function parseTranscriptTail(
 		return { entries: [], cursor: 0, hasMore: false };
 	}
 
+	// Filter to renderable lines (skip progress, queue-operation, etc.)
+	const renderableLines = lineIndex.filter(({ line }) => isRenderableLine(line));
+
+	if (renderableLines.length === 0) {
+		return { entries: [], cursor: 0, hasMore: false };
+	}
+
 	// 0 = no limit, load all entries
-	const effectiveLimit = limit === 0 ? lineIndex.length : limit;
-	const startIdx = Math.max(0, lineIndex.length - effectiveLimit);
-	const linesToParse = lineIndex.slice(startIdx);
+	const effectiveLimit = limit === 0 ? renderableLines.length : limit;
+	const startIdx = Math.max(0, renderableLines.length - effectiveLimit);
+	const linesToParse = renderableLines.slice(startIdx);
 
 	const toolMap = new Map<string, string>();
 	const entries: ParsedEntry[] = [];

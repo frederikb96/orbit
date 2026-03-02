@@ -10,7 +10,6 @@ export interface OrbitConfig {
 		count: number; // Number of sessions to track, default 10
 		refreshIntervalMs: number; // Refresh interval, default 5000
 		watchPath: string; // Base path, default ~/.claude/projects
-		activeThresholdMs: number; // Session active if modified within this time, default 60000
 	};
 	transcript: {
 		initialLines: number; // Lines to load initially, default 100
@@ -24,7 +23,9 @@ export interface OrbitConfig {
 // UI configuration (sent to client)
 export interface UIConfig {
 	defaultExpandThinking: boolean;
-	defaultExpandToolCalls: boolean;
+	defaultExpandRead: boolean; // Read tool results
+	defaultExpandEdit: boolean; // Edit/Write/MultiEdit tools
+	defaultExpandOther: boolean; // All other tools (Bash, Glob, etc.)
 	pageSize: number; // Entries per page (default 500)
 	maxSessions: number; // Limit sidebar sessions, 0 = unlimited
 	sessionPollIntervalMs: number; // Client poll interval, 0 = disabled
@@ -32,8 +33,22 @@ export interface UIConfig {
 	sseMaxRetries: number; // Max SSE reconnect attempts
 	sseBaseDelayMs: number; // Base delay for SSE reconnect
 	sseMaxDelayMs: number; // Max delay for SSE reconnect
+	activeThresholdMs: number; // Session considered active if modified within this time
 	sessionTitleCommand?: string; // Bash command to fetch session title, {sessionId} placeholder
 	sessionTitleIntervalMs?: number; // Interval to refresh titles (default 15000)
+	useV3DualMode: boolean; // Enable V3 dual-mode (Live/Archive views)
+	v3: V3Config; // V3-specific performance options
+}
+
+// V3-specific configuration
+export interface V3Config {
+	maxLiveEntries: number; // Max entries in Live buffer (default 100)
+	sseDebounceMs: number; // SSE batch debounce delay (default 500)
+	autoScrollThreshold: number; // Pixels from bottom to trigger auto-scroll (default 50)
+	archiveInitialLoad: number; // Initial entries to load in Archive (default 100)
+	archivePageSize: number; // Entries per page in Archive (default 50)
+	maxMemoryMB: number; // Memory warning threshold (default 200)
+	archiveMaxEntries: number; // Row 33: Hard limit on entries to prevent memory issues (default 10000)
 }
 
 // Session types
@@ -45,8 +60,8 @@ export interface Session {
 	type: SessionType;
 	lastSeen: number; // mtime in ms
 	mtime: number; // alias for lastSeen (client compatibility)
-	size: number; // file size in bytes
-	active: boolean; // true if modified within activeThresholdMs
+	active: boolean; // Deprecated - client computes dynamically
+	name?: string; // Session name (set via REST endpoint)
 }
 
 // Transcript entry types (Claude Code JSONL format)
@@ -141,7 +156,7 @@ export interface PaginatedEntries {
 }
 
 // SSE event types
-export type SSEEventType = 'init' | 'batch' | 'truncated' | 'ping';
+export type SSEEventType = 'init' | 'batch' | 'truncated' | 'ping' | 'sessions';
 
 export interface SSEEvent {
 	type: SSEEventType;
@@ -149,4 +164,44 @@ export interface SSEEvent {
 	entries?: ParsedEntry[];
 	cursor?: number;
 	hasMore?: boolean;
+}
+
+// V3 Dual-Mode Architecture Types
+
+export type ViewMode = 'live' | 'archive';
+
+export interface LiveState {
+	entries: ParsedEntry[]; // Current buffer (max N entries)
+	isConnected: boolean; // SSE connection status
+}
+
+export interface ArchiveState {
+	snapshotTimestamp: string; // Frozen cutoff time
+	entries: ParsedEntry[]; // Full loaded entries
+	isLoading: boolean; // Initial load in progress
+	loadingProgress: number; // 0-100 percentage
+	hasMore: boolean; // More pages to load
+	nextCursor: string | null; // For pagination
+	anchorEntryId: string | null; // For position preservation
+	newEntriesCount: number; // Counter for badge
+}
+
+export interface LiveViewConfig {
+	maxEntries: number; // Default: 100, cap for buffer
+	debounceMs: number; // Default: 500, SSE debounce
+	autoScrollThreshold: number; // Default: 50, pixels from bottom
+}
+
+export interface ArchiveViewConfig {
+	initialLoadCount: number; // Default: 100, entries for instant load
+	pageSize: number; // Default: 50, entries per background page
+	maxMemoryMB: number; // Default: 200, warn if exceeded
+}
+
+export interface ArchiveResponse {
+	entries: ParsedEntry[];
+	snapshotTimestamp: string;
+	totalCount: number;
+	hasMore: boolean;
+	nextCursor: string | null;
 }

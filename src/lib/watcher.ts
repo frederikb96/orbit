@@ -1,47 +1,73 @@
 /**
  * File Watcher Module
  *
- * Uses fs.watch (recursive) for efficient file system monitoring.
- * Only pushes file paths to callback - does NOT read contents.
+ * Uses @parcel/watcher for reliable recursive directory monitoring on Linux.
+ * Uses fs.watch for single-file monitoring.
  */
 
-import { type FSWatcher, watch } from 'node:fs';
+import { dirname } from 'node:path';
+import parcelWatcher from '@parcel/watcher';
 
-/**
- * Create a recursive file watcher.
- *
- * @param path - Directory path to watch recursively
- * @param onFileChange - Callback invoked with the changed file path
- * @returns FSWatcher instance (call .close() to stop)
- */
-export function createWatcher(path: string, onFileChange: (filePath: string) => void): FSWatcher {
-	const watcher = watch(path, { recursive: true }, (event, filename) => {
-		if (event === 'change' && filename) {
-			// Construct full path from base path and relative filename
-			const fullPath = `${path}/${filename}`;
-			onFileChange(fullPath);
-		}
-	});
+export interface DirectoryWatcher {
+	close(): Promise<void>;
+}
 
-	return watcher;
+export interface FileWatcher {
+	close(): void;
 }
 
 /**
- * Create a watcher for a single file.
+ * Create a recursive directory watcher using @parcel/watcher.
  *
- * @param filePath - Absolute path to the file to watch
- * @param onFileChange - Callback invoked when file changes
- * @returns FSWatcher instance
+ * @param path - Directory path to watch recursively
+ * @param onFileChange - Callback invoked with the changed file path
+ * @returns DirectoryWatcher instance (call .close() to stop)
  */
-export function createFileWatcher(
-	filePath: string,
+export async function createWatcher(
+	path: string,
 	onFileChange: (filePath: string) => void,
-): FSWatcher {
-	const watcher = watch(filePath, (event) => {
-		if (event === 'change') {
-			onFileChange(filePath);
+): Promise<DirectoryWatcher> {
+	const subscription = await parcelWatcher.subscribe(path, (err, events) => {
+		if (err) {
+			console.error('Directory watcher error:', err);
+			return;
+		}
+		for (const event of events) {
+			if (event.type === 'create' || event.type === 'update') {
+				onFileChange(event.path);
+			}
 		}
 	});
 
-	return watcher;
+	return {
+		close: () => subscription.unsubscribe(),
+	};
+}
+
+/**
+ * Create a watcher for a single file using @parcel/watcher.
+ * Watches the parent directory and filters for the target file.
+ */
+export async function createFileWatcher(
+	filePath: string,
+	onFileChange: (filePath: string) => void,
+): Promise<FileWatcher> {
+	const dir = dirname(filePath);
+	const subscription = await parcelWatcher.subscribe(dir, (err, events) => {
+		if (err) {
+			console.error('File watcher error:', err);
+			return;
+		}
+		for (const event of events) {
+			if (event.path === filePath && (event.type === 'create' || event.type === 'update')) {
+				onFileChange(filePath);
+			}
+		}
+	});
+
+	return {
+		close() {
+			subscription.unsubscribe();
+		},
+	};
 }

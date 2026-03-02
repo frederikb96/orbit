@@ -1,13 +1,13 @@
 {
 	"name": "orbit",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"type": "module",
 	"description": "Web-based Claude Code transcript viewer with real-time streaming",
 	"author": "Frederik Berg",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/frederikb96/orbit.git"
+		"url": "git+ssh://git@github.com/frederikb96/orbit.git"
 	},
 	"bin": {
 		"orbit": "./src/cli.ts"
@@ -22,9 +22,18 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
+		"@parcel/watcher": "^2.5.6",
+		"ansi-to-html": "^0.7.2",
 		"commander": "^12.1.0",
+		"diff": "^8.0.3",
+		"diff2html": "^3.4.56",
 		"react": "^18.3.1",
-		"react-dom": "^18.3.1"
+		"react-dom": "^18.3.1",
+		"react-markdown": "^10.1.0",
+		"react-virtuoso": "^4.18.1",
+		"rehype-sanitize": "^6.0.0",
+		"remark-gfm": "^4.0.1",
+		"shiki": "^3.21.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.4",
@@ -32,5 +41,6 @@
 		"@types/react": "^18.3.12",
 		"@types/react-dom": "^18.3.1",
 		"typescript": "^5.7.2"
-	}
+	},
+	"trustedDependencies": ["@parcel/watcher"]
 }
