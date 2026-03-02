@@ -5,7 +5,16 @@
  * Uses @parcel/watcher events for incremental updates - no polling.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+	type Dirent,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { OrbitConfig, Session, SessionType } from '../types.ts';
@@ -21,11 +30,11 @@ function getSessionNamesPath(): string {
 
 // Session filename patterns - single source of truth
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const AGENT_PATTERN = /^agent-([a-f0-9]{7,8})$/i;
+const AGENT_PATTERN = /^agent-([a-f0-9]{7,})$/i;
 
 /**
  * Check if a filename is a valid session file.
- * Matches: {UUID}.jsonl or agent-{7-8hex}.jsonl
+ * Matches: {UUID}.jsonl or agent-{hex}.jsonl (pure hex ID, 7+ chars)
  */
 export function isValidSessionFilename(filename: string): boolean {
 	const nameWithoutExt = filename.replace(/\.jsonl$/, '');
@@ -37,16 +46,15 @@ export function isValidSessionFilename(filename: string): boolean {
  * Used before passing IDs to shell commands.
  */
 export function isValidSessionId(id: string): boolean {
-	// UUID format
 	if (UUID_PATTERN.test(id)) return true;
-	// Agent ID: 7-8 hex chars (extracted from agent-{hex}.jsonl)
-	if (/^[a-f0-9]{7,8}$/i.test(id)) return true;
+	if (/^[a-f0-9]{7,}$/i.test(id)) return true;
 	return false;
 }
 
 export type SessionChangeListener = (sessions: Session[]) => void;
 
-const NOTIFY_DEBOUNCE_MS = 500; // Increased to reduce SSE traffic during active sessions
+const NOTIFY_DEBOUNCE_MS = 500;
+const RESUBSCRIBE_DEBOUNCE_MS = 5_000;
 
 export class SessionManager {
 	private config: OrbitConfig;
@@ -55,6 +63,7 @@ export class SessionManager {
 	private watcher: DirectoryWatcher | null = null;
 	private listeners: Set<SessionChangeListener> = new Set();
 	private notifyTimer: ReturnType<typeof setTimeout> | null = null;
+	private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
 
 	constructor(config?: OrbitConfig) {
 		this.config = config ?? getConfig();
@@ -110,22 +119,41 @@ export class SessionManager {
 			clearTimeout(this.notifyTimer);
 			this.notifyTimer = null;
 		}
+		if (this.resubscribeTimer) {
+			clearTimeout(this.resubscribeTimer);
+			this.resubscribeTimer = null;
+		}
 	}
 
 	/**
 	 * Handle a file change event - incremental update.
-	 * Handles both file modifications and deletions.
+	 * Handles .jsonl file modifications/deletions and directory creation.
 	 */
 	private handleFileEvent(filePath: string): void {
 		const filename = basename(filePath);
 
-		// Quick pattern check - reject non-session files early
-		if (!filename.endsWith('.jsonl')) return;
+		if (filename.endsWith('.jsonl')) {
+			this.handleJsonlEvent(filePath, filename);
+			return;
+		}
+
+		// @parcel/watcher misses subdirectories created via recursive mkdir.
+		// When a new directory appears, scan it for session files and re-subscribe
+		// so future events in the new subtree are detected.
+		try {
+			if (lstatSync(filePath).isDirectory()) {
+				this.handleNewDirectory(filePath);
+			}
+		} catch {
+			// Path vanished or permission denied
+		}
+	}
+
+	private handleJsonlEvent(filePath: string, filename: string): void {
 		if (!isValidSessionFilename(filename)) return;
 
 		// Check if file still exists (handles deletion via 'rename' event)
 		if (!existsSync(filePath)) {
-			// File was deleted - remove from sessions if present
 			const nameWithoutExt = filename.replace(/\.jsonl$/, '');
 			let sessionId: string | null = null;
 
@@ -145,7 +173,6 @@ export class SessionManager {
 			return;
 		}
 
-		// Event time = this file is now the newest
 		const eventTime = Date.now();
 		const session = this.fileToSession(filePath, eventTime);
 		if (!session) return;
@@ -154,16 +181,91 @@ export class SessionManager {
 		this.sessions.delete(session.id);
 		this.sessions.set(session.id, session);
 
-		// Trim to max count (oldest = first in Map)
+		this.trimSessions();
+		this.scheduleNotify();
+	}
+
+	/**
+	 * Scan a newly created directory for session files.
+	 * Then re-subscribe the watcher so future events in it are detected.
+	 */
+	private handleNewDirectory(dirPath: string): void {
+		let changed = false;
+
+		try {
+			const entries = readdirSync(dirPath, {
+				recursive: true,
+				withFileTypes: true,
+			}) as Dirent[];
+
+			for (const entry of entries) {
+				if (!entry.isFile()) continue;
+				if (!entry.name.endsWith('.jsonl')) continue;
+				if (!isValidSessionFilename(entry.name)) continue;
+
+				const parentPath = entry.parentPath ?? (entry as unknown as { path: string }).path;
+				const fullPath = join(parentPath, entry.name);
+
+				try {
+					const stat = lstatSync(fullPath);
+					const session = this.fileToSession(fullPath, stat.mtimeMs);
+					if (!session) continue;
+
+					this.sessions.delete(session.id);
+					this.sessions.set(session.id, session);
+					changed = true;
+				} catch {
+					// File vanished between readdir and stat
+				}
+			}
+		} catch {
+			// Directory vanished or permission denied
+		}
+
+		if (changed) {
+			this.trimSessions();
+			this.scheduleNotify();
+		}
+
+		this.scheduleResubscribe();
+	}
+
+	private trimSessions(): void {
 		while (this.sessions.size > this.config.sessions.count) {
 			const oldest = this.sessions.keys().next().value;
 			if (oldest) {
 				this.sessions.delete(oldest);
 			}
 		}
+	}
 
-		// Notify listeners (debounced)
-		this.scheduleNotify();
+	/**
+	 * Debounced watcher re-subscribe to pick up new subdirectories.
+	 * Creates new subscription before closing old one (zero event gap).
+	 */
+	private scheduleResubscribe(): void {
+		if (this.resubscribeTimer) return;
+		this.resubscribeTimer = setTimeout(async () => {
+			this.resubscribeTimer = null;
+			if (!this.watcher) return;
+			try {
+				// Must close before re-subscribing — @parcel/watcher doesn't
+				// set up inotify watches correctly with two concurrent subscriptions
+				await this.watcher.close();
+				this.watcher = await createWatcher(this.config.sessions.watchPath, (fp) =>
+					this.handleFileEvent(fp),
+				);
+			} catch {
+				// Re-subscribe failed — try to restore watcher
+				try {
+					this.watcher = await createWatcher(this.config.sessions.watchPath, (fp) =>
+						this.handleFileEvent(fp),
+					);
+				} catch {
+					this.watcher = null;
+				}
+			}
+		}, RESUBSCRIBE_DEBOUNCE_MS);
 	}
 
 	/**

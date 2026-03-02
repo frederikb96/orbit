@@ -19,19 +19,24 @@ describe('isValidSessionFilename', () => {
 	});
 
 	describe('Agent patterns', () => {
-		test('accepts valid agent files (7-8 hex chars)', () => {
+		test('accepts agent files with any hex ID length (7+)', () => {
 			expect(isValidSessionFilename('agent-a637779.jsonl')).toBe(true);
 			expect(isValidSessionFilename('agent-1234567.jsonl')).toBe(true);
 			expect(isValidSessionFilename('agent-abcdef0.jsonl')).toBe(true);
 			expect(isValidSessionFilename('agent-12345678.jsonl')).toBe(true);
+			expect(isValidSessionFilename('agent-a9ffc2ab775c09e1d.jsonl')).toBe(true);
+			expect(isValidSessionFilename('agent-a35cd2dc480e5bd02.jsonl')).toBe(true);
+			expect(isValidSessionFilename('agent-0f1214867f7e4a09dbaaaa0671e.jsonl')).toBe(true);
 		});
 
-		test('rejects agent files with wrong length', () => {
+		test('rejects agent files with too-short hex ID', () => {
 			expect(isValidSessionFilename('agent-123456.jsonl')).toBe(false);
-			expect(isValidSessionFilename('agent-123456789.jsonl')).toBe(false);
+			expect(isValidSessionFilename('agent-abc.jsonl')).toBe(false);
 		});
 
-		test('rejects agent files with description prefix', () => {
+		test('rejects compact and prompt_suggestion files', () => {
+			expect(isValidSessionFilename('agent-acompact-006389.jsonl')).toBe(false);
+			expect(isValidSessionFilename('agent-acompact-00c79b83ab96b1a8.jsonl')).toBe(false);
 			expect(isValidSessionFilename('agent-aprompt_suggestion-a637779.jsonl')).toBe(false);
 			expect(isValidSessionFilename('agent-foo-1234567.jsonl')).toBe(false);
 		});
@@ -93,7 +98,7 @@ describe('isValidSessionId', () => {
 		});
 	});
 
-	describe('Agent IDs (7-8 hex chars)', () => {
+	describe('Agent IDs (hex, 7+ chars)', () => {
 		test('accepts valid 7-char agent IDs', () => {
 			expect(isValidSessionId('a637779')).toBe(true);
 			expect(isValidSessionId('1234567')).toBe(true);
@@ -104,14 +109,20 @@ describe('isValidSessionId', () => {
 			expect(isValidSessionId('abcdef01')).toBe(true);
 		});
 
+		test('accepts longer hex agent IDs (15, 17, 25 chars)', () => {
+			expect(isValidSessionId('a9ffc2ab775c09e1d')).toBe(true);
+			expect(isValidSessionId('a35cd2dc480e5bd02')).toBe(true);
+			expect(isValidSessionId('0f1214867f7e4a09dbaaaa0671e')).toBe(true);
+		});
+
 		test('accepts uppercase hex (case-insensitive)', () => {
 			expect(isValidSessionId('ABCDEF0')).toBe(true);
 			expect(isValidSessionId('AbCdEf01')).toBe(true);
 		});
 
-		test('rejects wrong lengths', () => {
+		test('rejects too-short IDs', () => {
 			expect(isValidSessionId('123456')).toBe(false);
-			expect(isValidSessionId('123456789')).toBe(false);
+			expect(isValidSessionId('abc')).toBe(false);
 		});
 
 		test('rejects non-hex chars', () => {

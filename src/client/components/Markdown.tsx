@@ -6,6 +6,7 @@
  */
 
 import { memo, useMemo } from 'react';
+import type { Components, ExtraProps } from 'react-markdown';
 import ReactMarkdown from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
 import remarkGfm from 'remark-gfm';
@@ -18,32 +19,27 @@ interface MarkdownProps {
 
 export const Markdown = memo(function Markdown({ content, className = '' }: MarkdownProps) {
 	const components = useMemo(
-		() => ({
-			// Fenced code blocks with syntax highlighting
-			code: ({
-				className: codeClassName,
-				children,
-			}: {
-				className?: string;
-				children?: React.ReactNode;
-			}) => {
-				// Extract language from className (e.g., "language-typescript")
-				const match = /language-(\w+)/.exec(codeClassName || '');
-				const language = match ? match[1] : undefined;
-
-				// In react-markdown v9+, inline code has no language class
-				const isInline = !language;
-
-				if (isInline) {
-					return <InlineCode>{children}</InlineCode>;
+		(): Components => ({
+			// Fenced code blocks: intercept at <pre> level to catch language-less blocks
+			pre: ({ node, children, ...rest }: React.HTMLAttributes<HTMLPreElement> & ExtraProps) => {
+				const codeChild = node?.children?.[0];
+				if (codeChild && 'tagName' in codeChild && codeChild.tagName === 'code') {
+					const props = (codeChild as { properties?: Record<string, unknown> }).properties;
+					const classNames = props?.className;
+					const classStr = Array.isArray(classNames) ? classNames.join(' ') : '';
+					const match = /language-(\w+)/.exec(classStr);
+					const language = match ? match[1] : undefined;
+					const children = (codeChild as { children?: { type?: string; value?: string }[] })
+						.children;
+					const rawText = children?.map((c) => (c.type === 'text' ? c.value : '')).join('') || '';
+					return <CodeBlock code={rawText.replace(/\n$/, '')} language={language} />;
 				}
-
-				const code = String(children).replace(/\n$/, '');
-
-				return <CodeBlock code={code} language={language} />;
+				return <pre {...rest}>{children}</pre>;
 			},
-			// Override pre to not add extra wrapper
-			pre: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
+			// Inline code only (fenced blocks handled by pre override above)
+			code: ({ children }: React.HTMLAttributes<HTMLElement> & ExtraProps) => {
+				return <InlineCode>{children}</InlineCode>;
+			},
 		}),
 		[],
 	);

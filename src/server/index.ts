@@ -45,6 +45,7 @@ export class OrbitServer {
 	private sessionListClients: Map<string, SessionListClient> = new Map();
 	private sessionListClientCounter = 0;
 	private unsubscribeSessionChanges: (() => void) | null = null;
+	private pendingSelectSession: { id: string; timestamp: number } | null = null;
 
 	constructor(config?: OrbitConfig) {
 		this.config = config ?? getConfig();
@@ -260,6 +261,19 @@ export class OrbitServer {
 			}
 		}
 
+		// POST /api/select-session/:id - Remote session selection (used by orbit-session script)
+		const selectMatch = path.match(/^\/api\/select-session\/([^/]+)$/);
+		if (selectMatch && req.method === 'POST') {
+			const id = selectMatch[1];
+
+			if (!isValidSessionId(id)) {
+				return Response.json({ error: 'Invalid session ID' }, { status: 400 });
+			}
+
+			this.broadcastSelectSession(id);
+			return Response.json({ success: true });
+		}
+
 		// POST /api/session-titles - Batch fetch titles
 		if (path === '/api/session-titles' && req.method === 'POST') {
 			const command = this.config.ui.sessionTitleCommand;
@@ -345,10 +359,18 @@ export class OrbitServer {
 				const initData = `data: ${JSON.stringify({ type: 'sessions', sessions: clientSessions })}\n\n`;
 				controller.enqueue(encoder.encode(initData));
 
+				// Deliver pending session selection (from cold start)
+				const pending = this.pendingSelectSession;
+				if (pending && Date.now() - pending.timestamp < 10_000) {
+					const selectData = `data: ${JSON.stringify({ type: 'select-session', sessionId: pending.id })}\n\n`;
+					controller.enqueue(encoder.encode(selectData));
+				}
+				this.pendingSelectSession = null;
+
 				// Keep-alive ping
 				const pingInterval = setInterval(() => {
 					try {
-						controller.enqueue(encoder.encode(': ping\n\n'));
+						controller.enqueue(encoder.encode('data: {"type":"heartbeat"}\n\n'));
 					} catch {
 						// Client disconnected - cleanup
 						clearInterval(pingInterval);
@@ -375,6 +397,30 @@ export class OrbitServer {
 				Connection: 'keep-alive',
 			},
 		});
+	}
+
+	/**
+	 * Broadcast session selection to all connected SSE clients.
+	 * If no clients are connected, queues the selection for the next connecting client.
+	 */
+	private broadcastSelectSession(sessionId: string): void {
+		if (this.sessionListClients.size === 0) {
+			this.pendingSelectSession = { id: sessionId, timestamp: Date.now() };
+			return;
+		}
+
+		const data = `data: ${JSON.stringify({ type: 'select-session', sessionId })}\n\n`;
+		const encoder = new TextEncoder();
+		const encoded = encoder.encode(data);
+
+		for (const [clientId, client] of this.sessionListClients) {
+			try {
+				client.controller.enqueue(encoded);
+			} catch {
+				clearInterval(client.pingInterval);
+				this.sessionListClients.delete(clientId);
+			}
+		}
 	}
 
 	/**

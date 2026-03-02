@@ -228,7 +228,7 @@ export class SSEHandler {
 				// Keep-alive ping
 				pingInterval = setInterval(() => {
 					try {
-						controller.enqueue(encoder.encode(': ping\n\n'));
+						controller.enqueue(encoder.encode('data: {"type":"heartbeat"}\n\n'));
 					} catch {
 						if (pingInterval) clearInterval(pingInterval);
 					}
@@ -378,7 +378,7 @@ export class SSEHandler {
 				// Keep-alive ping
 				pingInterval = setInterval(() => {
 					try {
-						controller.enqueue(encoder.encode(': ping\n\n'));
+						controller.enqueue(encoder.encode('data: {"type":"heartbeat"}\n\n'));
 					} catch {
 						if (pingInterval) clearInterval(pingInterval);
 					}
