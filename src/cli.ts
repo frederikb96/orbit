@@ -53,7 +53,8 @@ async function healthCheck(port: number, attempts = 30, intervalMs = 500): Promi
 
 const program = new Command();
 
-program.name('orbit').description('Claude Code transcript viewer').version('0.1.0');
+const pkg = await Bun.file(join(dirname(import.meta.path), '..', 'package.json')).json();
+program.name('orbit').description('Claude Code transcript viewer').version(pkg.version);
 
 program
 	.command('start')

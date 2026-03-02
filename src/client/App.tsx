@@ -123,25 +123,6 @@ export function App() {
 		localStorage.setItem('orbit-sidebar-width', String(sidebarWidth));
 	}, [sidebarWidth]);
 
-	// Session titles fetched via bash command
-	const [sessionTitles, setSessionTitles] = useState<Record<string, string | null>>({});
-
-	// Session title fetching disabled - causes high CPU due to slow csm calls
-	// TODO: Re-enable with on-demand fetching instead of polling
-	// useEffect(() => {
-	// 	const command = config.sessionTitleCommand;
-	// 	const intervalMs = config.sessionTitleIntervalMs || 15000;
-	// 	if (!command || sessions.length === 0) return;
-	// 	const fetchTitles = async () => {
-	// 		const sessionIds = sessions.map((s) => s.id);
-	// 		const res = await fetch('/api/session-titles', { method: 'POST', ... });
-	// 		...
-	// 	};
-	// 	fetchTitles();
-	// 	const interval = setInterval(fetchTitles, intervalMs);
-	// 	return () => clearInterval(interval);
-	// }, [sessions, config.sessionTitleCommand, config.sessionTitleIntervalMs]);
-
 	// SSE reconnect settings from config
 	const sseBaseDelayMs = config.sseBaseDelayMs;
 	const sseMaxDelayMs = config.sseMaxDelayMs;
@@ -219,7 +200,7 @@ export function App() {
 					const data = JSON.parse(event.data);
 					if (data.type === 'heartbeat') return;
 
-					// Remote session selection (from orbit-session script)
+					// Remote session selection via API
 					if (data.type === 'select-session' && data.sessionId) {
 						setSessions((current) => {
 							const session = current.find((s) => s.id === data.sessionId);
@@ -825,7 +806,6 @@ export function App() {
 				onRefresh={handleRefresh}
 				width={sidebarWidth}
 				onWidthChange={setSidebarWidth}
-				sessionTitles={sessionTitles}
 				mruCycleSession={mruCycleSession}
 			/>
 			<main className="main-content">
@@ -850,7 +830,7 @@ export function App() {
 							viewMode === 'live' ? (
 								<LiveView
 									sessionId={selectedSession.id}
-									sessionTitle={selectedSession.name ?? sessionTitles[selectedSession.id] ?? null}
+									sessionTitle={selectedSession.name ?? null}
 									entries={entries}
 									tokens={tokens}
 									isConnected={isSSEConnected}
@@ -870,7 +850,7 @@ export function App() {
 							) : (
 								<ArchiveView
 									session={selectedSession}
-									sessionTitle={selectedSession.name ?? sessionTitles[selectedSession.id] ?? null}
+									sessionTitle={selectedSession.name ?? null}
 									snapshotTimestamp={archiveSnapshotTimestamp}
 									entries={archiveEntries}
 									isLoading={archiveLoading}
@@ -898,7 +878,7 @@ export function App() {
 							// Legacy TranscriptView
 							<TranscriptView
 								session={selectedSession}
-								sessionTitle={selectedSession.name ?? sessionTitles[selectedSession.id] ?? null}
+								sessionTitle={selectedSession.name ?? null}
 								entries={entries}
 								tokens={tokens}
 								transcriptLoading={transcriptLoading}

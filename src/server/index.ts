@@ -261,7 +261,7 @@ export class OrbitServer {
 			}
 		}
 
-		// POST /api/select-session/:id - Remote session selection (used by orbit-session script)
+		// POST /api/select-session/:id - Remote session selection via API
 		const selectMatch = path.match(/^\/api\/select-session\/([^/]+)$/);
 		if (selectMatch && req.method === 'POST') {
 			const id = selectMatch[1];

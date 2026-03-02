@@ -13,7 +13,6 @@ interface SidebarProps {
 	onRefresh: () => void;
 	width: number;
 	onWidthChange: (width: number) => void;
-	sessionTitles: Record<string, string | null>;
 	mruCycleSession: Session | null;
 }
 
@@ -24,7 +23,6 @@ export function Sidebar({
 	onRefresh,
 	width,
 	onWidthChange,
-	sessionTitles,
 	mruCycleSession,
 }: SidebarProps) {
 	const { config } = useConfig();
@@ -113,7 +111,6 @@ export function Sidebar({
 							<SessionItem
 								key={session.id}
 								session={session}
-								title={sessionTitles[session.id] ?? null}
 								isSelected={selectedSession?.id === session.id}
 								isActive={true}
 								isMruPreview={mruCycleSession?.id === session.id}
@@ -131,7 +128,6 @@ export function Sidebar({
 						<SessionItem
 							key={session.id}
 							session={session}
-							title={sessionTitles[session.id] ?? null}
 							isSelected={selectedSession?.id === session.id}
 							isActive={false}
 							isMruPreview={mruCycleSession?.id === session.id}
@@ -157,26 +153,17 @@ export function Sidebar({
 
 interface SessionItemProps {
 	session: Session;
-	title: string | null;
 	isSelected: boolean;
 	isActive: boolean;
 	isMruPreview: boolean;
 	onSelect: (session: Session) => void;
 }
 
-function SessionItem({
-	session,
-	title,
-	isSelected,
-	isActive,
-	isMruPreview,
-	onSelect,
-}: SessionItemProps) {
+function SessionItem({ session, isSelected, isActive, isMruPreview, onSelect }: SessionItemProps) {
 	const timeAgo = formatTimeAgo(session.mtime);
 	const typeIcon = session.type === 'agent' ? '\uD83E\uDD16' : '\uD83D\uDCAC';
 	const shortId = session.id.slice(0, 8);
-	// Prefer server-set name, then legacy title prop, then shortId
-	const displayName = session.name ?? title ?? shortId;
+	const displayName = session.name ?? shortId;
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === 'Enter' || e.key === ' ') {
