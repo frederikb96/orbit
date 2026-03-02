@@ -1,13 +1,13 @@
 {
 	"name": "orbit",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"type": "module",
 	"description": "Web-based Claude Code transcript viewer with real-time streaming",
 	"author": "Frederik Berg",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/frederikb96/orbit.git"
+		"url": "git+ssh://git@github.com/frederikb96/orbit.git"
 	},
 	"bin": {
 		"orbit": "./src/cli.ts"
