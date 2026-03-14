@@ -24,7 +24,7 @@
 	"dependencies": {
 		"@parcel/watcher": "^2.5.6",
 		"ansi-to-html": "^0.7.2",
-		"commander": "^12.1.0",
+		"commander": "^14.0.0",
 		"diff": "^8.0.3",
 		"diff2html": "^3.4.56",
 		"react": "^18.3.1",
